@@ -64,8 +64,9 @@ def normalize_messages(
     - ShareGPT format ({"from": "human", "value": "..."})
     - Single-field conversations (list of dicts with any key combo)
 
-    - A conversation stored as a JSON string (common in exports whose tool-call
-      arguments differ in shape from row to row, which Arrow cannot store natively)
+    - A conversation stored as a JSON string, or each of its messages as one (common in
+      exports whose tool-call arguments differ in shape from row to row, which Arrow
+      cannot store natively; the Hub's automatic parquet conversion does the latter)
     - Tool-call arguments stored as JSON strings (the OpenAI wire format): parsed to
       dicts, which is what chat templates iterate over (Qwen3.x, Llama 3.x, ...)
     - Other per-message keys (`tool_call_id`, `name`, `loss`, ...) are kept; keys whose
@@ -96,6 +97,11 @@ def normalize_messages(
 
     normalized = []
     for turn in raw:
+        if isinstance(turn, str):  # one message as a JSON string
+            try:
+                turn = json.loads(turn)
+            except json.JSONDecodeError:
+                continue
         if not isinstance(turn, dict):
             continue
 
@@ -237,8 +243,16 @@ def normalize_tools(tools: Any) -> list[dict] | None:
         tools = [tools]
     if not isinstance(tools, list):
         return None
-    tools = [t for t in tools if isinstance(t, dict)]
-    return tools or None
+    decoded = []
+    for t in tools:
+        if isinstance(t, str):  # one definition as a JSON string (Hub parquet conversions)
+            try:
+                t = json.loads(t)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(t, dict):
+            decoded.append(t)
+    return decoded or None
 
 
 def is_trained_message(msg: dict[str, Any]) -> bool:

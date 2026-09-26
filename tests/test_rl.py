@@ -606,9 +606,9 @@ class _StreamingEngine:
         return bool(self.live)
 
     def stream_step(self):
-        from palingenesis.opd.rollout import Rollout
-
         import time
+
+        from palingenesis.opd.rollout import Rollout
 
         time.sleep(0.001)  # a decode step
         if any(p[1] == [666] for p in self.live.values()):

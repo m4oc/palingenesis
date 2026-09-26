@@ -6,6 +6,9 @@ keeps a document from attending to the previous one depends on the layer:
   * attention (sdpa, eager, flex): transformers builds a block-diagonal causal mask
     from `position_ids`, but only when `attention_mask` is None. With a 2D mask of
     ones it builds a plain causal mask and every document sees the ones before it.
+    A flattened row under sdpa in training runs variable-length flash attention instead
+    (seco._varlen_attention, from `cu_seq_lens_q`): with the mask, SDPA's memory-efficient
+    kernel did L^2 work over the whole packed row (75% of a Qwen3.5 CPT step).
   * flash_attention_2: variable-length kernels, from `cu_seq_lens_q/k` and
     `max_length_q/k`, for one flattened row.
   * linear attention (Qwen3.5 / Qwen3-Next Gated DeltaNet): the recurrent state is
@@ -107,8 +110,9 @@ class PackedBatch:
             cu_seqlens = torch.cat([bounds, bounds.new_tensor([position_ids.shape[1]])]).to(torch.int32)
             kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_k"] = cu_seqlens
             kwargs["seq_idx"] = (torch.cumsum(starts.to(torch.int32), 0) - 1).to(torch.int32)[None]
-            if attn_implementation == "flash_attention_2":
-                longest = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
-                kwargs["max_length_q"] = kwargs["max_length_k"] = longest
+            # the variable-length flash kernels (flash_attention_2, and sdpa's routed through
+            # seco._varlen_attention) take the longest document
+            longest = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+            kwargs["max_length_q"] = kwargs["max_length_k"] = longest
         kwargs["position_ids"] = position_ids
         return cls(input_ids=input_ids, labels=labels, forward_kwargs=kwargs, loss_weights=loss_weights)

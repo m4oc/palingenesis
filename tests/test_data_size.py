@@ -243,3 +243,48 @@ def test_preference_runs_are_sized_without_a_pass(tmp_path, monkeypatch):
     loaded = load_dataset("json", data_files=str(path), split="train")
     exact = sum(1 for _ in build_preference_dataloader(loaded, TOK, data, dpo, 0, 1, 4))
     assert abs(est.micro_batches_per_epoch - exact) / exact < 0.06, (est.micro_batches_per_epoch, exact)
+
+
+@needs_tok
+def test_pretraining_splits_long_documents_and_the_estimate_counts_the_chunks(tmp_path, monkeypatch):
+    from palingenesis.config import DataConfig
+    from palingenesis.data import PretrainDataset, build_dataset, estimate_run
+
+    doc = " ".join(f"parola{i % 50}" for i in range(3000))  # several max_seq_length chunks
+    chunks = PretrainDataset([], TOK, 256)._process({"text": doc})
+    ids = TOK(doc)["input_ids"]
+    assert sum(c["input_ids"].numel() for c in chunks) == len(ids)  # nothing dropped
+    assert all(c["input_ids"].numel() <= 256 for c in chunks) and len(chunks) == -(-len(ids) // 256)
+
+    monkeypatch.setenv("PALINGENESIS_SIZE_SAMPLE", "400")
+    rng = random.Random(7)
+    rows = [{"text": " ".join("w" for _ in range(int(rng.lognormvariate(5.5, 1.0))))} for _ in range(600)]
+    path = _write_jsonl(tmp_path / "text.jsonl", rows)
+    config = DataConfig(sources=[{"dataset": str(path), "mode": "pretrain"}], max_seq_length=256, packing=True)
+    est = estimate_run(config, TOK, 1, 4)
+    exact = sum(1 for _ in build_dataset(config, TOK, config, 0, 1, 4)) // 4
+    assert abs(est.micro_batches_per_epoch - exact) / exact < 0.05, (est.micro_batches_per_epoch, exact)
+
+
+def test_packed_rows_use_variable_length_flash_attention():
+    """A flattened packed row (cu_seq_lens) attends within each document: the variable-length
+    flash kernel equals per-document causal attention, grouped K/V heads included."""
+    import torch
+    import torch.nn.functional as F
+
+    if not torch.cuda.is_available():
+        pytest.skip("flash kernels need CUDA")
+    from palingenesis.seco import _varlen_attention
+
+    torch.manual_seed(0)
+    lens = [300, 1024, 17, 700]
+    L, H, KV, D = sum(lens), 8, 2, 256
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    q, k, v = (torch.randn(1, h, L, D, device="cuda", dtype=torch.bfloat16) for h in (H, KV, KV))
+    out = _varlen_attention(q, k, v, cu, None, D**-0.5)
+    ref = []
+    for a, b in zip(cu[:-1].tolist(), cu[1:].tolist()):
+        kk, vv = (t[:, :, a:b].float().repeat_interleave(H // KV, 1) for t in (k, v))
+        ref.append(F.scaled_dot_product_attention(q[:, :, a:b].float(), kk, vv, is_causal=True).transpose(1, 2))
+    ref = torch.cat(ref, 1)
+    assert float((out.float() - ref).abs().max() / ref.abs().max()) < 1e-2

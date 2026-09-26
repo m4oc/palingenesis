@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -582,6 +583,7 @@ def measure_source(
     population: Census | None,
     make_stage,
     per_row: list[list[int]] | None = None,
+    deadline: float | None = None,
 ) -> SourceEstimate:
     """Run the sampled rows through the source's per-row pipeline (make_stage(dataset) -> the
     ChatDataset/PretrainDataset for it) and estimate what a row of the population yields
@@ -592,8 +594,14 @@ def measure_source(
     stage = make_stage([])  # its per-row step (_process) is what its iteration applies to each row
     per_row = per_row if per_row is not None else []
     for row in sample.rows[len(per_row) :]:  # rows of earlier rounds are measured already
-        out = stage._process(row)
-        per_row.append([] if out is None else [int(out["input_ids"].numel())])
+        if deadline is not None and len(per_row) >= 50 and time.monotonic() >= deadline:
+            break  # out of time: the rows measured so far are a uniform random subsample
+        out = stage._process(row)  # an example, None, or a list of them (a split document)
+        examples = out if isinstance(out, list) else [] if out is None else [out]
+        per_row.append([int(ex["input_ids"].numel()) for ex in examples])
+    if len(per_row) < len(sample.rows):
+        n = len(per_row)
+        sample = Sample(sample.rows[:n], sample.sizes[:n], sample.weights[:n], sample.uniform)
     examples, examples_error = stratified_mean(sample, [len(r) for r in per_row], population)
     tokens, tokens_error = stratified_mean(sample, [sum(r) for r in per_row], population)
     lengths = [n for r in per_row for n in r]
@@ -617,12 +625,19 @@ def sample_size() -> int:
     return int(os.environ.get("PALINGENESIS_SIZE_SAMPLE", SAMPLE_ROWS))
 
 
+def time_budget() -> float:
+    """Seconds a source's size estimate may spend on its rows (PALINGENESIS_SIZE_SECONDS):
+    rows that take long to render (100k-character agent traces) stop the sampling early,
+    with a larger reported error, instead of costing what the full scan would."""
+    return float(os.environ.get("PALINGENESIS_SIZE_SECONDS", 60))
+
+
 def target_error() -> float:
     """Relative standard error sequential sampling stops at (PALINGENESIS_SIZE_PRECISION)."""
     return float(os.environ.get("PALINGENESIS_SIZE_PRECISION", 0.005))
 
 
-def sequential(draw, evaluate, rounds: int = 8, population: int | None = None):
+def sequential(draw, evaluate, rounds: int = 8, population: int | None = None, deadline: float | None = None):
     """Sample until the estimate is precise enough: draw(round) -> a Sample, evaluate(sample)
     -> (estimate, relative standard error). Stops at target_error(), after `rounds` rounds,
     or once the pooled sample reaches a quarter of the `population` (two rounds at least):
@@ -635,6 +650,8 @@ def sequential(draw, evaluate, rounds: int = 8, population: int | None = None):
         if not sample.rows or sample.exhaustive or not sample.uniform or result[1] <= target_error():
             break
         if limit is not None and len(sample.rows) >= limit:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
             break
         sample.extend(draw(r))
         result = evaluate(sample)

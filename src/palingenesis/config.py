@@ -654,16 +654,6 @@ class Config:
                 "which may confuse MONA's curvature estimates. UNTESTED combination."
             )
 
-        if self.data.packing and self.train.max_steps <= 0:
-            warnings.append(
-                "packing=true with an epochs-based LR horizon: total_steps is derived from ROW "
-                "count, but packing merges several rows per sequence, so the epoch ends well "
-                "before the schedule completes and training finishes at a barely-decayed LR "
-                "(no anneal). Set train.max_steps explicitly (≈ total_dataset_tokens / "
-                "(per_device_batch_size × grad_accum × max_seq_length × world_size)), or use "
-                "lr_scheduler: wsd, which tolerates an overestimated horizon."
-            )
-
         # ── Raise on errors ───────────────────────────────────────────────
         if errors:
             msg = "Configuration has incompatible settings:\n" + "\n".join(f"  ✗ {e}" for e in errors)

@@ -49,6 +49,7 @@ Rows may be right-padded (padding only follows real tokens, and causality keeps
 it inert). Packed sequences are not supported.
 """
 
+import contextvars
 import logging
 import random
 from contextlib import contextmanager
@@ -112,9 +113,19 @@ _ACTIVE: dict[int, tuple[KVStore, int, int]] = {}
 KV_BLOCK = 8192  # prefix tokens per attention block (bounds per-block memory and transfers)
 
 
+# Set by the training loop around a packed forward whose rows were flattened with
+# cu_seq_lens (packing.PackedBatch): the attention layers run variable-length flash
+# attention over the documents, so the [L, L] block-diagonal mask transformers would build
+# from position_ids (1 GiB at 32k tokens, and a memory-efficient kernel doing L^2 work over
+# the whole packed row) is not needed.
+PACKED_VARLEN: contextvars.ContextVar[bool] = contextvars.ContextVar("pgs_packed_varlen", default=False)
+
+
 def _mask(*args, **kwargs):
     from transformers.masking_utils import causal_mask_function, sdpa_mask
 
+    if PACKED_VARLEN.get():
+        return None
     plain_causal = (
         kwargs.get("mask_function") is causal_mask_function
         and kwargs.get("attention_mask") is None
@@ -125,6 +136,32 @@ def _mask(*args, **kwargs):
     return None if plain_causal else sdpa_mask(*args, **kwargs)
 
 
+def _varlen_attention(query, key, value, cu_seqlens, max_len, scaling):
+    """Causal attention within each packed document of a flattened [1, H, L, D] row: the
+    flash kernel's variable-length form (cu_seqlens), grouped K/V heads natively. Each
+    document attends only to itself, with no mask; the cost is the sum of the documents'
+    squared lengths instead of the row's. None when the flash kernel does not apply."""
+    if query.is_cuda and torch.is_autocast_enabled("cuda"):
+        dtype = torch.get_autocast_dtype("cuda")
+        query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+    head = query.shape[-1]
+    if not (
+        query.is_cuda
+        and query.shape[0] == 1
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and head % 8 == 0
+        and head <= 256
+        and key.shape[-1] == value.shape[-1] == head
+    ):
+        return None
+    q, k, v = (t[0].transpose(0, 1).contiguous() for t in (query, key, value))  # [L, heads, D]
+    cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
+    if max_len is None:
+        max_len = int((cu[1:] - cu[:-1]).max())
+    out = torch.ops.aten._flash_attention_forward(q, k, v, cu, cu, max_len, max_len, 0.0, True, False, scale=scaling)[0]
+    return out.unsqueeze(0)  # [1, L, heads, D]: the layout attention interfaces return
+
+
 def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
     from torch.nn.attention.bias import causal_lower_right
     from transformers.integrations.sdpa_attention import repeat_kv, sdpa_attention_forward
@@ -132,6 +169,15 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
     q_len, kv_len = query.shape[2], key.shape[2]
     causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
     special = any(kwargs.get(k) is not None for k in ("position_bias", "s_aux", "sinks"))
+    cu_seqlens = kwargs.get("cu_seq_lens_q")
+    # packed documents of a flattened row (cu_seq_lens from packing.PackedBatch): variable-length
+    # flash attention is exactly the packed block-diagonal causal mask, with or without the mask
+    # built (it is not, under PACKED_VARLEN), and activation checkpointing's recompute replays the
+    # same arguments, so forward and recompute take the same path
+    if cu_seqlens is not None and causal and not special and not dropout and q_len == kv_len:
+        out = _varlen_attention(query, key, value, cu_seqlens, kwargs.get("max_length_q"), scaling)
+        if out is not None:
+            return out, None
     entry = _ACTIVE.get(getattr(module, "layer_idx", None))
     if entry is not None:
         store, prefix, block = entry

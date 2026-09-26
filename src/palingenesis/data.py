@@ -41,6 +41,7 @@ import math
 import os
 import random
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -608,8 +609,8 @@ class ChatDataset(_Epochs, IterableDataset):
             messages = normalized
             if not self._renders_reasoning():  # baked <think> blocks stay in the content
                 messages = restore_baked_think(messages)
-        elif not isinstance(messages, list):
-            return None
+        elif not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            return None  # unparseable: dropped (counted), not a crash
         # If normalization returns None, use raw messages (may still work with some templates)
 
         # Smart truncation: if conversation exceeds max_seq_length, truncate at
@@ -1246,6 +1247,9 @@ class ChatDataset(_Epochs, IterableDataset):
             for k in range(1, len(messages) + 1)
             if messages[k - 1].get("role") == "assistant" and is_trained_message(messages[k - 1])
         ]
+        if not ends:  # nothing to train on, however it is cut
+            self.stats["dropped_no_target"] += 1
+            return None
         # Largest end whose ESTIMATED length fits (renders only; they grow with the turns).
         lo, hi, guess = 0, len(ends) - 1, -1
         while lo <= hi:
@@ -1273,7 +1277,12 @@ class ChatDataset(_Epochs, IterableDataset):
 
 
 class PretrainDataset(_Epochs, IterableDataset):
-    """Pretraining/CPT dataset: loss on ALL tokens (no masking)."""
+    """Pretraining/CPT dataset: loss on ALL tokens (no masking). A document longer than
+    max_seq_length becomes consecutive max_seq_length-token chunks (truncating it would drop
+    the rest of the text: a quarter of a typical CPT corpus at 4k tokens); a trailing chunk
+    shorter than MIN_CHUNK tokens is dropped."""
+
+    MIN_CHUNK = 16
 
     def __init__(
         self,
@@ -1302,27 +1311,22 @@ class PretrainDataset(_Epochs, IterableDataset):
             self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed, self.shuffle, self.epoch
         )
         for example in dataset:
-            result = self._process(example)
-            if result is not None:
-                yield result
+            yield from self._process(example)
 
-    def _process(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
+    def _process(self, example: dict[str, Any]) -> list[dict[str, torch.Tensor]]:
+        """The document's chunks (none for an empty one)."""
         text = example.get(self.text_field, "")
         if not text:
-            return None
-        tokens = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors="pt",
-            add_special_tokens=True,
-        )
-        input_ids = tokens["input_ids"].squeeze(0)
-        attn_mask = tokens["attention_mask"].squeeze(0)
-        # Pretraining: loss on ALL tokens (standard causal LM)
-        labels = input_ids.clone()
-        labels[attn_mask == 0] = IGNORE_INDEX
-        return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
+            return []
+        ids = torch.tensor(self.tokenizer(text, add_special_tokens=True)["input_ids"], dtype=torch.long)
+        chunks = []
+        for start in range(0, ids.numel(), self.max_seq_length):
+            chunk = ids[start : start + self.max_seq_length]
+            if chunk.numel() < self.MIN_CHUNK and start > 0:
+                break
+            # Pretraining: loss on ALL tokens (standard causal LM)
+            chunks.append({"input_ids": chunk, "attention_mask": torch.ones_like(chunk), "labels": chunk.clone()})
+        return chunks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1751,11 +1755,21 @@ def estimate_run(
         rows = data_size.count_rows(dataset_id, split, loaded)
         population = data_size.census(dataset_id, split, loaded)
         per_row: list[list[int]] = []
+        deadline = time.monotonic() + data_size.time_budget()
 
         def draw(r, dataset_id=dataset_id, split=split, i=i, loaded=loaded):
             return data_size.sample_rows(dataset_id, split, k, config.seed + i + 7919 * r, loaded)
 
-        def evaluate(sample, name=name, rows=rows, weight=weight, population=population, src=src, per_row=per_row):
+        def evaluate(
+            sample,
+            name=name,
+            rows=rows,
+            weight=weight,
+            population=population,
+            src=src,
+            per_row=per_row,
+            deadline=deadline,
+        ):
             est = data_size.measure_source(
                 name,
                 rows,
@@ -1764,6 +1778,7 @@ def estimate_run(
                 population,
                 lambda raw: source_stage(raw, tokenizer, config, src, 0, 1),
                 per_row,
+                deadline,
             )
             if est.examples_per_row == 0:  # nothing to measure (reported below): no more rounds
                 return est, 0.0
@@ -1772,7 +1787,7 @@ def estimate_run(
             return est, est.examples_error / max(est.examples_per_row, 1e-9)
 
         # rounds of rows until this source's yield is known to data_size.target_error()
-        _, (estimate, _) = data_size.sequential(draw, evaluate, population=rows)
+        _, (estimate, _) = data_size.sequential(draw, evaluate, population=rows, deadline=deadline)
         sources.append(estimate)
     for source in sources:
         if source.examples_per_row == 0 and source.rows:

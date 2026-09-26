@@ -111,7 +111,7 @@ from palingenesis.plugins import (
     infosft_weighted_loss,
     pre_rl_loss,
 )
-from palingenesis.seco import chunkwise_forward_backward, use_chunk_attention
+from palingenesis.seco import PACKED_VARLEN, chunkwise_forward_backward, use_chunk_attention
 
 logger = logging.getLogger(__name__)
 
@@ -1074,6 +1074,8 @@ def train(config: Config):
 
             loss_val = None
             backward_done = False
+            # a flattened packed row: variable-length attention over its documents (seco.PACKED_VARLEN)
+            _varlen = PACKED_VARLEN.set(position_ids is not None and flatten_packed)
             with torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16):
                 if seco:
                     # Forward AND backward, chunk by chunk (gradients accumulate in .grad).
@@ -1216,6 +1218,8 @@ def train(config: Config):
                     outputs = model(**fwd_kwargs)
                     logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                     loss = cross_entropy_loss(logits, labels, loss_denom, weights=loss_weights)
+
+            PACKED_VARLEN.reset(_varlen)
 
             # ── RL-readiness: record output entropy (once per logged step) ──
             if config.logging.rl_readiness and is_last_micro and (global_step + 1) % config.train.logging_steps == 0:

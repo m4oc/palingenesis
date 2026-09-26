@@ -186,3 +186,18 @@ def test_think_tags_validation():
 
     assert valid_think_tags(["[THINK]", "[/THINK]"])
     assert not valid_think_tags(["<think>"]) and not valid_think_tags(["x", "x"]) and not valid_think_tags(["", "y"])
+
+
+def test_messages_and_tools_stored_as_json_strings_are_decoded():
+    """The Hub's parquet conversion stores each message (and tool) of mixed-shape rows as
+    a JSON string."""
+    import json
+
+    from palingenesis.validate_data import normalize_messages, normalize_tools
+
+    row = {
+        "messages": [json.dumps({"role": "user", "content": "hi"}), json.dumps({"role": "assistant", "content": "yo"})],
+        "tools": [json.dumps({"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}})],
+    }
+    assert [m["role"] for m in normalize_messages(row)] == ["user", "assistant"]
+    assert normalize_tools(row["tools"])[0]["function"]["name"] == "f"
