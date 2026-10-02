@@ -178,10 +178,18 @@ class Pipeline:
             teacher,
             # meta["tools"]: tool schemas of a function-calling prompt, rendered for student and teacher alike;
             # meta["chat_template_kwargs"]: the row's own template kwargs (e.g. its thinking mode) over the model's
-            encode_prompt(self.student_tok, messages, {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
-                          meta.get("tools")),
-            encode_prompt(self.routes[teacher].tokenizer, messages,
-                          {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})}, meta.get("tools")),
+            encode_prompt(
+                self.student_tok,
+                messages,
+                {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
+                meta.get("tools"),
+            ),
+            encode_prompt(
+                self.routes[teacher].tokenizer,
+                messages,
+                {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
+                meta.get("tools"),
+            ),
         )
 
     def generate(self, prompts: list[list[int]], max_new_tokens: list[int], temperature: float):

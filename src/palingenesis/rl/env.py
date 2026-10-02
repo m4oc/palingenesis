@@ -79,8 +79,17 @@ from palingenesis.rl.chat import tool_schema
 
 logger = logging.getLogger(__name__)
 
-_LIFECYCLE = ("reset", "get_reward", "close", "aclose", "tool_schemas", "call_tool", "tools", "text_actions",
-              "observation_text")
+_LIFECYCLE = (
+    "reset",
+    "get_reward",
+    "close",
+    "aclose",
+    "tool_schemas",
+    "call_tool",
+    "tools",
+    "text_actions",
+    "observation_text",
+)
 
 
 class ToolFailed(Exception):

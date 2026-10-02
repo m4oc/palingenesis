@@ -276,7 +276,9 @@ class RLPipeline:
                 text_protocol = False
                 if env is not None and not (parsed.calls or parsed.errors) and hasattr(env, "text_actions"):
                     actions = await call_sync_or_async(env.text_actions, parsed.content) or []
-                    parsed.calls = [ToolCall(name, dict(args or {}), f"call_{turn}_{k}") for k, (name, args) in enumerate(actions)]
+                    parsed.calls = [
+                        ToolCall(name, dict(args or {}), f"call_{turn}_{k}") for k, (name, args) in enumerate(actions)
+                    ]
                     text_protocol = bool(parsed.calls)
                 if env is None or not (parsed.calls or parsed.errors):
                     trajectory.finish = "stop"
@@ -286,8 +288,10 @@ class RLPipeline:
                     break
                 t_tools = clock()
                 results = await asyncio.gather(  # text-protocol actions are validated by the environment itself
-                    *(run_tool(env, c.name, c.arguments, e.tool_timeout, None if text_protocol else set(by_name))
-                      for c in parsed.calls)
+                    *(
+                        run_tool(env, c.name, c.arguments, e.tool_timeout, None if text_protocol else set(by_name))
+                        for c in parsed.calls
+                    )
                 )
                 turn_timing["tools_s"] = clock() - t_tools
                 observations = [
@@ -302,8 +306,11 @@ class RLPipeline:
                 observations += [{"role": "tool", "content": error} for error in parsed.errors]
                 if text_protocol:  # one user turn with the results, in the environment's own format
                     render = getattr(env, "observation_text", None)
-                    body = render([(c.name, out_text) for c, (out_text, _) in zip(parsed.calls, results)]) if render \
+                    body = (
+                        render([(c.name, out_text) for c, (out_text, _) in zip(parsed.calls, results)])
+                        if render
                         else "\n\n".join(out_text for out_text, _ in results)
+                    )
                     observations = [{"role": "user", "content": body}]
                 for o in observations:
                     o["content"] = self.chat.truncate(self.chat.sanitize(o["content"]), e.max_tool_output_tokens)

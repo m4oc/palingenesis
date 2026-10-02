@@ -1,0 +1,30 @@
+# Adapt storageClassName and sizes to the cluster's provisioner.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: palingenesis-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: palingenesis-outputs
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: palingenesis-cache
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Gi

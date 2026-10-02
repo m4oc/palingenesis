@@ -75,8 +75,11 @@ class HarborTask:
     def load(cls, root: str | Path) -> "HarborTask":
         root = Path(root)
         config = tomllib.loads((root / "task.toml").read_text()) if (root / "task.toml").exists() else {}
-        instruction = (root / "instruction.md").read_text() if (root / "instruction.md").exists() else \
-            config.get("task", {}).get("description", "")
+        instruction = (
+            (root / "instruction.md").read_text()
+            if (root / "instruction.md").exists()
+            else config.get("task", {}).get("description", "")
+        )
         name = config.get("task", {}).get("name") or root.name
         return cls(root, name, instruction.strip(), config)
 
@@ -114,8 +117,10 @@ class HarborTask:
         return explicit or f"{IMAGE_PREFIX}:{self.context_hash()}"
 
 
-SYSTEM = ("You work in a Linux container through tools; the working directory is /workdir and there is no internet. "
-          "Inspect before you change things, check your result, then call submit and tell the user briefly what you did.")
+SYSTEM = (
+    "You work in a Linux container through tools; the working directory is /workdir and there is no internet. "
+    "Inspect before you change things, check your result, then call submit and tell the user briefly what you did."
+)
 
 
 def harbor_rows(tasks_dir: str | Path, system: str | None = SYSTEM) -> list[dict]:
@@ -133,7 +138,9 @@ def harbor_rows(tasks_dir: str | Path, system: str | None = SYSTEM) -> list[dict
 # ------------------------------------------------------------------ docker
 
 
-def _docker(*args: str, input: bytes | None = None, timeout: float | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def _docker(
+    *args: str, input: bytes | None = None, timeout: float | None = None, check: bool = True
+) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], input=input, capture_output=True, timeout=timeout, check=check)
 
 
@@ -175,9 +182,19 @@ class DockerRuntime:
         """provision: copy the starting files and run environment/setup.sh (off for the verifier's clean container)."""
         env = self.task.environment
         image = build_image(self.task)
-        args = ["run", "-d", "--name", self.name, "--init",
-                "--cpus", str(env.get("cpus", 1)), "--memory", f"{int(env.get('memory_mb', 2048))}m",
-                "--pids-limit", str(env.get("pids_limit", 512))]
+        args = [
+            "run",
+            "-d",
+            "--name",
+            self.name,
+            "--init",
+            "--cpus",
+            str(env.get("cpus", 1)),
+            "--memory",
+            f"{int(env.get('memory_mb', 2048))}m",
+            "--pids-limit",
+            str(env.get("pids_limit", 512)),
+        ]
         if not env.get("allow_internet", False):
             args += ["--network", "none"]
         for k, v in (env.get("env") or {}).items():
@@ -207,7 +224,9 @@ class DockerRuntime:
             else:
                 raise RuntimeError(f"healthcheck failed for {self.task.name}")
 
-    def exec(self, command: str, timeout: float = 60, env: dict | None = None, workdir: str | None = None) -> ExecResult:
+    def exec(
+        self, command: str, timeout: float = 60, env: dict | None = None, workdir: str | None = None
+    ) -> ExecResult:
         args = ["exec"]
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
@@ -220,7 +239,7 @@ class DockerRuntime:
         cut = self.max_output
         out, err = r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
         if len(out) > cut:
-            out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2:]
+            out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2 :]
         return ExecResult(r.returncode, out, err[-cut:])
 
     def put_files(self, files: dict[str, bytes | str], dest: str = "/") -> None:
@@ -234,7 +253,9 @@ class DockerRuntime:
         _docker("cp", "-", f"{self.name}:{dest}", input=buf.getvalue(), timeout=60)
 
     def put_dir(self, local: Path, dest: str) -> None:
-        files = {str(Path(dest.lstrip("/")) / p.relative_to(local)): p.read_bytes() for p in local.rglob("*") if p.is_file()}
+        files = {
+            str(Path(dest.lstrip("/")) / p.relative_to(local)): p.read_bytes() for p in local.rglob("*") if p.is_file()
+        }
         if files:
             self.put_files(files, "/")
 
@@ -266,7 +287,9 @@ class DockerRuntime:
         self.exec("rm -rf /tests /logs/verifier && mkdir -p /tests /logs/verifier", timeout=30, workdir="/")
         self.put_dir(tests, "/tests")
         venv = {k: os.path.expandvars(str(v)) for k, v in (self.task.verifier.get("env") or {}).items()}
-        r = self.exec("bash /tests/test.sh", timeout=float(self.task.verifier.get("timeout_sec", 120)), env=venv, workdir="/")
+        r = self.exec(
+            "bash /tests/test.sh", timeout=float(self.task.verifier.get("timeout_sec", 120)), env=venv, workdir="/"
+        )
         raw_json = self.read_file("/logs/verifier/reward.json")
         if raw_json:
             try:
@@ -293,18 +316,36 @@ class DockerRuntime:
 
 
 def _fn(name, desc, props, req):
-    return {"type": "function", "function": {"name": name, "description": desc,
-                                             "parameters": {"type": "object", "properties": props, "required": req}}}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": desc,
+            "parameters": {"type": "object", "properties": props, "required": req},
+        },
+    }
 
 
 TOOL_SCHEMAS = {
-    "bash": _fn("bash", "Run a shell command in the task's container (working directory /workdir) and return its output.",
-                {"command": {"type": "string"}, "timeout": {"type": "integer", "description": "Seconds (default 60)."}}, ["command"]),
+    "bash": _fn(
+        "bash",
+        "Run a shell command in the task's container (working directory /workdir) and return its output.",
+        {"command": {"type": "string"}, "timeout": {"type": "integer", "description": "Seconds (default 60)."}},
+        ["command"],
+    ),
     "read_file": _fn("read_file", "Read a text file.", {"path": {"type": "string"}}, ["path"]),
-    "write_file": _fn("write_file", "Create or overwrite a text file.", {"path": {"type": "string"}, "content": {"type": "string"}},
-                      ["path", "content"]),
-    "str_replace": _fn("str_replace", "Replace an exact piece of text in a file (it must occur exactly once).",
-                       {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, ["path", "old", "new"]),
+    "write_file": _fn(
+        "write_file",
+        "Create or overwrite a text file.",
+        {"path": {"type": "string"}, "content": {"type": "string"}},
+        ["path", "content"],
+    ),
+    "str_replace": _fn(
+        "str_replace",
+        "Replace an exact piece of text in a file (it must occur exactly once).",
+        {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
+        ["path", "old", "new"],
+    ),
     "submit": _fn("submit", "Finish the task (call it when the work is done).", {}, []),
 }
 
@@ -314,8 +355,13 @@ class HarborEnv:
     the task's tests as the reward. Rows carry "task_dir". Synchronous (the pipeline runs sync methods in worker threads),
     so other environments can compose it; the container stops when the episode is released (close)."""
 
-    def __init__(self, tools: list[str] | None = None, reward_key: str = "reward", workdir: str = "/workdir",
-                 max_output: int = 16000):
+    def __init__(
+        self,
+        tools: list[str] | None = None,
+        reward_key: str = "reward",
+        workdir: str = "/workdir",
+        max_output: int = 16000,
+    ):
         self.tool_names = list(tools or TOOL_SCHEMAS)
         self.reward_key = reward_key
         self.workdir = workdir
@@ -375,8 +421,10 @@ class HarborEnv:
             logger.warning("verifier failed for %s: %s", self.task.name, e)
             comps = {"reward": 0.0, "metric/verifier_failed": 1.0}
         main = comps.get(self.reward_key, next(iter(comps.values()), 0.0))
-        return {"reward": float(main), **{(k if k.startswith("metric/") else f"metric/{k}"): v for k, v in comps.items()
-                                           if k != self.reward_key}}
+        return {
+            "reward": float(main),
+            **{(k if k.startswith("metric/") else f"metric/{k}"): v for k, v in comps.items() if k != self.reward_key},
+        }
 
     def close(self) -> None:
         if self.rt is not None:
@@ -445,8 +493,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(results, indent=1))
     else:
         for res in results:
-            print(f"{'ok ' if res['valid'] else 'BAD'}  oracle={res.get('oracle')} nop={res.get('nop')}  {res['task']}"
-                  + (f"  {res.get('oracle_error') or res.get('nop_error')}" if not res["valid"] else ""))
+            print(
+                f"{'ok ' if res['valid'] else 'BAD'}  oracle={res.get('oracle')} nop={res.get('nop')}  {res['task']}"
+                + (f"  {res.get('oracle_error') or res.get('nop_error')}" if not res["valid"] else "")
+            )
         print(f"{sum(x['valid'] for x in results)}/{len(results)} valid")
     return 0 if all(x["valid"] for x in results) else 1
 

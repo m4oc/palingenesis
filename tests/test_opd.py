@@ -774,9 +774,15 @@ def test_messages_source_rows_carry_template_kwargs_and_may_end_on_tool_results(
     from palingenesis.opd.orchestrator import Pipeline
     from palingenesis.opd.sources import ChatMessagesSource
 
-    state = [{"role": "user", "content": "Luci?"},
-             {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}]},
-             {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'}]
+    state = [
+        {"role": "user", "content": "Luci?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}],
+        },
+        {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'},
+    ]
     rows = [{"messages": state, "chat_template_kwargs": {"enable_thinking": True}} for _ in range(3)]
     rows += [{"messages": [{"role": "user", "content": f"Ciao {i}"}]} for i in range(3)]
     rows += [{"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]}]  # skipped

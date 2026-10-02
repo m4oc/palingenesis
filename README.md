@@ -152,4 +152,9 @@ pytest tests/
 
 ---
 
+## Container deployment
+
+See [Containers and Kubernetes training](docs/containers.md) for the Docker image,
+GHCR publishing workflow, GPU Job manifests, persistent storage and runtime secrets.
+
 *A new form emerging from what came before.*

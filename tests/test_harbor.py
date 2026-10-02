@@ -42,11 +42,15 @@ def test_episode_with_tools_and_verifier_reward():
             assert "[exit code 0]" in out and "hi" in out
             env.call_tool("write_file", {"path": "hello.txt", "content": "cia0\n"})
             assert env.get_reward()["reward"] == 0.0
-            assert (env.call_tool("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"})).startswith("Edited")
+            assert (env.call_tool("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"})).startswith(
+                "Edited"
+            )
             env.call_tool("submit", {})
             assert env.done
             assert env.get_reward()["reward"] == 1.0
-            assert "network" in (env.call_tool("bash", {"command": "getent hosts example.com || echo no network"})).lower()
+            assert (
+                "network" in (env.call_tool("bash", {"command": "getent hosts example.com || echo no network"})).lower()
+            )
         finally:
             env.close()
 
@@ -65,8 +69,13 @@ def test_setup_runs_and_verifier_is_isolated_from_the_agent(tmp_path):
         try:
             assert "seeded" in env.call_tool("bash", {"command": "cat seeded.txt"})
             # an agent that forges the reward from a background process must not reach the verifier
-            env.call_tool("bash", {"command": "nohup bash -c 'while true; do echo 1 > /logs/verifier/reward.txt; "
-                                                    "done' >/dev/null 2>&1 &"})
+            env.call_tool(
+                "bash",
+                {
+                    "command": "nohup bash -c 'while true; do echo 1 > /logs/verifier/reward.txt; "
+                    "done' >/dev/null 2>&1 &"
+                },
+            )
             assert env.get_reward()["reward"] == 0.0
         finally:
             env.close()

@@ -504,12 +504,27 @@ def test_text_protocol_environment_runs_actions_from_text():
     eot = end_of_turn_id(tok, kwargs)
     engine = ScriptedEngine(tok, eot, ["<lookup>capital</lookup>", "The capital is Rome.", "never"])
     config = RLConfig()
-    for key, value in {"model.policy": "x", "model.chat_template_kwargs": kwargs, "env.max_turns": 4,
-                       "rollout.max_new_tokens": 64, "rollout.max_model_len": 4096}.items():
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 4,
+        "rollout.max_new_tokens": 64,
+        "rollout.max_model_len": 4096,
+    }.items():
         config.set(key, value)
     rows = [{"prompt": "Use <lookup>key</lookup> to look things up. What is the capital?"}]
-    pipeline = RLPipeline(tok, ChatFormat(tok, eot, kwargs), engine, PublishedWeights(torch.nn.Linear(1, 1)), config,
-                          PromptSampler(rows), [], EnvPool(_TagProtocol), None, (eot,))
+    pipeline = RLPipeline(
+        tok,
+        ChatFormat(tok, eot, kwargs),
+        engine,
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        PromptSampler(rows),
+        [],
+        EnvPool(_TagProtocol),
+        None,
+        (eot,),
+    )
     try:
         (group,) = pipeline._await(pipeline._eval(rows, 1.0))
     finally:

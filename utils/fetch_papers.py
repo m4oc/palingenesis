@@ -2,8 +2,8 @@
 import sys
 import tempfile
 from pathlib import Path
-from urllib.request import urlretrieve, Request, urlopen
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 PAPERS_DIR = Path(__file__).parent / "papers"
 

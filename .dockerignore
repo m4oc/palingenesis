@@ -1,0 +1,12 @@
+# Only application sources and dependency metadata enter the build context.
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!src/**
+!agent_tooling/
+!agent_tooling/**
+**/__pycache__/
+**/*.pyc
