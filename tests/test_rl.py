@@ -511,6 +511,63 @@ def test_prompt_sharing_gives_the_same_gradients(arch):
         assert torch.allclose(a, b, rtol=1e-5, atol=1e-8), (a - b).abs().max()
 
 
+def test_kl_term_is_the_same_with_prompt_sharing():
+    """The KL-to-reference term (loss.kl_coef > 0) on the plain path and on the prompt-sharing tree path: the same
+    loss, KL statistic and gradients."""
+    import random as _random
+
+    from test_seco import MODELS
+
+    from palingenesis.logits import output_head
+    from palingenesis.rl.losses import LowPrecisionWeight
+    from palingenesis.rl.parallel import Parallel
+    from palingenesis.rl.trainer import RLTrainer
+
+    class FakeReference:  # deterministic per-token reference log-probs from the trajectory's content
+        def logprobs(self, trajectories):
+            out = {}
+            for t in trajectories:
+                g = torch.Generator().manual_seed(hash(tuple(t.tokens)) % (2**31))
+                out[id(t)] = -torch.rand(sum(t.mask), generator=g) * 3
+            return out
+
+    def groups(seed):
+        rng = _random.Random(seed)
+        out = []
+        for g in range(3):
+            prompt = [rng.randrange(1, 90) for _ in range(rng.randint(5, 30))]
+            group = []
+            for _ in range(4):
+                n = rng.randint(3, 25)
+                t = Trajectory({}, g, prompt, [], tokens=[rng.randrange(1, 90) for _ in range(n)],
+                               mask=[True] * n, logprobs=[-rng.random() * 3 for _ in range(n)])
+                t.reward = rng.random()
+                group.append(t)
+            out.append(group)
+        return out
+
+    results = []
+    for sharing in ("off", "on"):
+        trainer = object.__new__(RLTrainer)
+        trainer.config = RLConfig()
+        trainer.config.set("train.prompt_sharing", sharing)
+        trainer.config.set("train.micro_tokens", 64)
+        trainer.config.set("loss.kl_coef", 0.1)
+        trainer.parallel, trainer.device, trainer.pad_id = Parallel(fsdp=False), "cpu", 0
+        torch.manual_seed(0)
+        trainer.model = MODELS["gpt2"]()
+        trainer.head, trainer.head_weight = output_head(trainer.model), LowPrecisionWeight()
+        trainer.reference = FakeReference()
+        metrics = trainer._train_step(groups(0))
+        results.append((metrics, [p.grad.clone() for p in trainer.model.parameters() if p.grad is not None]))
+    (plain, pg), (tree, tg) = results
+    assert plain["policy/kl_ref"] > 0
+    for key in ("loss", "policy/kl_ref"):
+        assert abs(plain[key] - tree[key]) <= 1e-5 * max(1.0, abs(plain[key])), (key, plain[key], tree[key])
+    for a, b in zip(pg, tg):
+        assert torch.allclose(a, b, rtol=1e-4, atol=1e-7), (a - b).abs().max()
+
+
 def test_checkpoint_named_parameters_takes_gathered_tensors():
     """The FSDP weight push passes full tensors gathered from the shards in place of the
     model's own (sharded) parameters."""

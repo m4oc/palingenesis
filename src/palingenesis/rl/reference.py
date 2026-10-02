@@ -59,7 +59,10 @@ class ReferencePolicy:
     def reset_to(self, model: torch.nn.Module) -> None:
         """Make the reference the current policy (ProRL's reference reset)."""
         state = {k: v.detach().to(torch.bfloat16) for k, v in model.state_dict().items()}
-        self.model.load_state_dict(state, strict=False)
+        result = self.model.load_state_dict(state, strict=False)
+        if result.missing_keys or result.unexpected_keys:  # a partial reset would leave a stale anchor, silently
+            raise RuntimeError(f"reference reset: parameter names differ from the policy's "
+                               f"(missing {result.missing_keys[:3]}, unexpected {result.unexpected_keys[:3]})")
 
 
 def kl_k3(policy_lp: torch.Tensor, reference_lp: torch.Tensor) -> torch.Tensor:
