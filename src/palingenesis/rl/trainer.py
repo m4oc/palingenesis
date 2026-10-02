@@ -167,6 +167,11 @@ class RLTrainer:
             "cpu, then sharded" if fsdp else self.device,
         )
         self.model = load_causal_lm(self.resume_path or m.policy, torch.float32)
+        if self.resume_path:
+            # exports follow the layout of the checkpoint the model was loaded from (checkpoint.save_hf_model,
+            # source_layout): after a resume that would be a step_* dir, which checkpoint rotation deletes
+            # mid-run (exports then silently lost the multimodal layout). The policy has the same layout and stays.
+            self.model.config._name_or_path = m.policy
         # training forwards need no KV cache: building one costs memory, and a checkpointed layer
         # recomputed in the backward would append to it again (different shapes: a hard error)
         for model_config in (self.model.config, getattr(self.model.config, "text_config", None)):

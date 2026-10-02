@@ -81,7 +81,9 @@ def _source_checkpoint(model):
         return None
     try:
         config = AutoConfig.from_pretrained(name)
-    except Exception:  # noqa: BLE001 — no source to follow
+    except Exception as e:  # noqa: BLE001 — no source to follow
+        # the export falls back to the model's own architecture (for Qwen3.5: text-only, which vLLM cannot serve)
+        logger.warning("source checkpoint %s is not readable (%s): saving in the model's own layout", name, e)
         return None
     if config.model_type == own.model_type:
         return None

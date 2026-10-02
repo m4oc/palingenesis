@@ -119,3 +119,23 @@ def test_a_plain_causal_lm_saves_as_before(tmp_path):
     model = AutoModelForCausalLM.from_pretrained(tmp_path / "src")
     save_hf_model(model, None, tmp_path / "out", source_layout=True)
     assert json.loads((tmp_path / "out" / "config.json").read_text())["model_type"] == "qwen3"
+
+
+def test_a_rotated_away_source_warns_and_the_policy_restores_the_layout(tmp_path, multimodal, caplog):
+    """A resumed RL run loads from a step_* dir that checkpoint rotation later deletes: exports must not silently lose
+    the multimodal layout (C6, 2026-10-02: final saved text-only). The trainer points the source at the policy."""
+    import shutil
+
+    from transformers import AutoModelForCausalLM
+
+    resume = tmp_path / "step_453"
+    shutil.copytree(multimodal, resume)
+    model = AutoModelForCausalLM.from_pretrained(resume)
+    shutil.rmtree(resume)  # rotation
+    with caplog.at_level("WARNING", logger="palingenesis.checkpoint"):
+        save_hf_model(model, None, tmp_path / "lost", source_layout=True)
+    assert "not readable" in caplog.text
+    model.config._name_or_path = str(multimodal)  # what the RL trainer now does after a resume (the policy)
+    save_hf_model(model, None, tmp_path / "kept", source_layout=True)
+    assert json.loads((tmp_path / "kept" / "config.json").read_text())["model_type"] == "qwen3_5"
+    assert _keys(tmp_path / "kept") == _keys(multimodal)
