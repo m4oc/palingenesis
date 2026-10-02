@@ -118,6 +118,18 @@ pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.js
 
 `distill-score` marks every multiple-choice pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. See the [distillation guide](https://mii-llm.github.io/palingenesis/guides/distillation/).
 
+## Agentic RL on Harbor-style task environments
+
+Small verifiable tasks, one directory each in the [Harbor](https://harborframework.com) layout (`task.toml`, `instruction.md`, `environment/`, `tests/test.sh`, `solution/solve.sh`), run in local Docker containers with no cloud sandbox and no Harbor dependency. Each episode gets a fresh container with the task's limits and no network; the policy works through `bash` / `read_file` / `write_file` / `str_replace` / `submit`; the hidden tests then run in a clean container that holds only a copy of the working directory, so the agent cannot tamper with its own reward.
+
+```bash
+pgs harbor check data/harbor_tasks                      # oracle must pass, doing nothing must fail
+pgs harbor rows data/harbor_tasks data/harbor_rows.jsonl
+pgs rl --config configs/rl_harbor.yaml                  # env: palingenesis.rl.envs.harbor:HarborEnv
+```
+
+Many tasks can share one prebuilt image (`[environment] docker_image`), with starting files in `environment/workdir/` and an optional `environment/setup.sh` (a database, a git repository).
+
 ## Multi-GPU / Multi-Node
 
 ```bash

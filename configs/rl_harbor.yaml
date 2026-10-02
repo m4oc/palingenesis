@@ -1,0 +1,42 @@
+# Agentic RL on small Harbor-style tasks: each episode is a fresh Docker container (task.toml limits, no network),
+# the policy works through bash / read_file / write_file / str_replace / submit, and the task's hidden tests are the
+# reward (palingenesis.rl.envs.harbor). Tasks: one directory per task (task.toml, instruction.md, environment/,
+# tests/test.sh, solution/solve.sh).
+#
+#   pgs harbor check data/harbor_tasks            # oracle must pass, doing nothing must fail
+#   pgs harbor rows data/harbor_tasks data/harbor_rows.jsonl
+#   pgs rl --config configs/rl_harbor.yaml
+
+model:
+  policy: Qwen/Qwen3.5-4B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/harbor_rows.jsonl
+  prompt_field: messages
+  eval_size: 64
+
+env:
+  type: palingenesis.rl.envs.harbor:HarborEnv
+  max_turns: 16
+  max_concurrent: 64          # containers alive at once (each has the task's CPU / memory limits)
+  max_tool_output_tokens: 1024
+  tool_timeout: 120           # a bash command may run tests or a build
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 8
+  max_new_tokens: 1024
+  max_completion_tokens: 6144
+  max_model_len: 16384
+  gpu_memory_utilization: 0.4
+
+loss:
+  advantage_std: group
+
+train:
+  output_dir: runs/rl_harbor
+  steps: 200
+  learning_rate: 1.0e-6
+  eval_every: 25

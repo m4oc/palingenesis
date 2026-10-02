@@ -29,6 +29,7 @@ Commands:
   distill     On-policy distillation: the student samples, its teachers score, KL update
   distill-score  Annotate an mcqa distillation pool with the teacher's answers (filter before training)
   rl          Reinforcement learning: rollouts scored by rewards (math, code, tools, your own)
+  harbor      Harbor task directories (Docker envs with tests): check oracle/nop, export RL rows
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
   prepare     Score and filter data by difficulty (offline, uses model inference)
   prepare-multi  Prepare multiple sources with per-source scoring + MSFT allocation
@@ -84,6 +85,11 @@ def main():
             from palingenesis.rl.trainer import main as rl_main
 
             rl_main()
+
+        case "harbor":
+            from palingenesis.rl.envs.harbor import main as harbor_main
+
+            sys.exit(harbor_main())
 
         case "distill-score":
             from palingenesis.opd.score_pool import main as distill_score_main
