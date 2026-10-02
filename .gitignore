@@ -31,3 +31,7 @@ projects/*/checkpoints/
 projects/*/checkpoints_cpt/
 projects/*/data/
 projects/*/prepared/
+
+# Research notebooks and papers (kept out of the library repo; preserved on the HF org)
+research/
+post-training/
