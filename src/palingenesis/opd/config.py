@@ -58,6 +58,8 @@ class TeacherConfig:
     # vllm: an already running server (empty = launch one on the student's GPU).
     url: str = ""
     gpu_memory_utilization: float = 0.15
+    # vllm: extra server arguments, e.g. ["--quantization", "fp8"] (a 27B teacher in ~28 GB next to the student).
+    vllm_args: list = field(default_factory=list)
     # Shared vocabulary: student end-of-turn token -> teacher's, e.g.
     # {"<|im_end|>": "<|eot_id|>"} (empty = auto, see token_bridge).
     eos_map: dict = field(default_factory=dict)
@@ -186,6 +188,9 @@ class OPDTrainConfig:
     output_dir: str = "./runs/opd"
     steps: int = 1000
     learning_rate: float = 1e-6
+    # "adamw" (fp32 moments, 16 bytes/param with the fp32 weights and grads) or "adamw8bit" /
+    # "paged_adamw8bit" (bitsandbytes 8-bit moments): room for a large teacher on the same GPU.
+    optimizer: str = "adamw"
     warmup_steps: int = 20
     lr_scheduler: str = "cosine"  # "cosine" or "constant"
     max_grad_norm: float = 1.0
@@ -450,6 +455,8 @@ class OPDConfig:
             errors.append(f"loss.xtok_spread must be 'chunk' or 'proportional', got {loss.xtok_spread!r}.")
         if not 0 < loss.is_low <= 1.0 <= loss.is_high:
             errors.append("loss.is_low must be in (0, 1] and loss.is_high >= 1.")
+        if self.train.optimizer not in ("adamw", "adamw8bit", "paged_adamw8bit"):
+            errors.append(f"train.optimizer must be adamw, adamw8bit or paged_adamw8bit, got {self.train.optimizer!r}.")
         if loss.top_k < 1:
             errors.append(f"loss.top_k must be >= 1, got {loss.top_k}.")
         if loss.rs_rounds < 1:

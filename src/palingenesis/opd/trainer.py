@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 TRAINER_STATE_FILE = "trainer_state.pt"  # written last: its presence marks a complete checkpoint
 
+MIN_COMPLETION = 64  # tokens of room a prompt must leave in rollout.max_model_len to be rolled out
 SHARED_VOCAB_LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "rs_kd")
 
 
@@ -248,10 +249,17 @@ class OPDTrainer:
         overlap = rollout.max_staleness > 0 and rollout.backend == "vllm_server" and self.device == "cuda"
         self.pipeline = self._make_pipeline(engine, overlap)
         self.source = source or self._make_source()
+        self.skipped_long = 0  # prompts too long for rollout.max_model_len (see _draw)
         self.orchestrator = Orchestrator(self.pipeline, self._draw, rollout.temperature, rollout.max_staleness)
-        self.opt = torch.optim.AdamW(
-            self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0, fused=self.device == "cuda"
-        )
+        if config.train.optimizer == "adamw":
+            self.opt = torch.optim.AdamW(
+                self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0, fused=self.device == "cuda"
+            )
+        else:  # 8-bit moments (bitsandbytes)
+            import bitsandbytes as bnb
+
+            cls = bnb.optim.PagedAdamW8bit if config.train.optimizer == "paged_adamw8bit" else bnb.optim.AdamW8bit
+            self.opt = cls(self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0)
         self.start_step, wandb_id = 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
@@ -310,6 +318,7 @@ class OPDTrainer:
                     "--max-logprobs",
                     str(top_k + 1),
                     "--enforce-eager",
+                    *map(str, teacher.vllm_args),
                 ],
             )
         )
@@ -317,13 +326,30 @@ class OPDTrainer:
     # ----------------------------------------------------------------- batches
 
     def _draw(self) -> list[Request]:
-        """The next step's requests: batch_prompts prompts x group_size rollouts each."""
-        requests = []
-        for _ in range(self.config.rollout.batch_prompts):
+        """The next step's requests: batch_prompts prompts x group_size rollouts each.
+
+        A prompt that leaves fewer than MIN_COMPLETION tokens of rollout.max_model_len is skipped and
+        another drawn (one over-long chat in a dataset must not end the run); one that fits but not with
+        its whole budget gets the room that is left."""
+        requests, limit = [], self.config.rollout.max_model_len
+        while len(requests) < self.config.rollout.batch_prompts * self.config.rollout.group_size:
             messages, max_new_tokens, meta = self.source.sample()
             source = meta.get("_src")
             teacher = self.config.teacher_of(source) if source in self.config.sources else next(iter(self.routes))
             request = self.pipeline.request(messages, max_new_tokens, meta, source, teacher)
+            longest = max(len(request.prompt_ids), len(request.teacher_prompt_ids))
+            if longest + MIN_COMPLETION > limit:
+                self.skipped_long += 1
+                if self.skipped_long in (1, 10, 100) or self.skipped_long % 1000 == 0:
+                    logger.warning(
+                        "Skipped %d prompt(s) longer than rollout.max_model_len=%d allows (last: %d tokens, source %s)",
+                        self.skipped_long,
+                        limit,
+                        longest,
+                        source,
+                    )
+                continue
+            request.max_new_tokens = min(request.max_new_tokens, limit - longest)
             requests += [request] * self.config.rollout.group_size
         return requests
 
@@ -623,18 +649,28 @@ class OPDTrainer:
         finally:
             self.student.train()
 
-    def greedy_generate(self, messages_list, max_new_tokens: int) -> list[str]:
-        prompts = [encode_prompt(self.tok, m, self.config.model.chat_template_kwargs) for m in messages_list]
+    def greedy_generate(self, messages_list, max_new_tokens: int, tools_list=None) -> list[str]:
+        tools_list = tools_list or [None] * len(messages_list)
+        prompts = [
+            encode_prompt(self.tok, m, self.config.model.chat_template_kwargs, t)
+            for m, t in zip(messages_list, tools_list)
+        ]
         rollouts, _ = self.pipeline.generate(prompts, [max_new_tokens] * len(prompts), 0.0)
         return [self.tok.decode(r.completion_ids, skip_special_tokens=True) for r in rollouts]
 
     @torch.no_grad()
-    def dev_kl(self, messages_list, max_new_tokens: int, source: str | None, teacher: str) -> dict[str, float]:
+    def dev_kl(
+        self, messages_list, max_new_tokens: int, source: str | None, teacher: str, tools_list=None
+    ) -> dict[str, float]:
         """Sample the held-out prompts on-policy, score them against `teacher`, no gradient.
 
         dev_kl is the sampled estimate sum(log p_S - log p_T) per student token, on one
         scale for every loss; dev_kl_full (full_rkl teachers) the exact per-token KL."""
-        requests = [self.pipeline.request(m, max_new_tokens, {}, source, teacher) for m in messages_list]
+        tools_list = tools_list or [None] * len(messages_list)
+        requests = [
+            self.pipeline.request(m, max_new_tokens, {"tools": t} if t else {}, source, teacher)
+            for m, t in zip(messages_list, tools_list)
+        ]
         with self.pipeline.lock:  # no rollout engine activity (vLLM sleep) while this scores on the GPU
             batch = self.pipeline.run(requests, self.config.rollout.temperature)
             if not batch.samples:
@@ -753,11 +789,11 @@ class _SourceEngine:
         config = trainer.config
         self.teacher = config.teacher_of(source) if source in config.sources else next(iter(trainer.routes))
 
-    def greedy_generate(self, messages_list, max_new_tokens: int) -> list[str]:
-        return self.trainer.greedy_generate(messages_list, max_new_tokens)
+    def greedy_generate(self, messages_list, max_new_tokens: int, tools_list=None) -> list[str]:
+        return self.trainer.greedy_generate(messages_list, max_new_tokens, tools_list)
 
-    def dev_kl(self, messages_list, max_new_tokens: int) -> dict[str, float]:
-        return self.trainer.dev_kl(messages_list, max_new_tokens, self.source, self.teacher)
+    def dev_kl(self, messages_list, max_new_tokens: int, tools_list=None) -> dict[str, float]:
+        return self.trainer.dev_kl(messages_list, max_new_tokens, self.source, self.teacher, tools_list)
 
 
 def main():

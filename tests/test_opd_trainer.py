@@ -285,3 +285,23 @@ def test_token_weighting_rules():
     assert (kept > 0).sum() == 3 and set((kept > 0).nonzero().flatten().tolist()) == set(
         entropy.topk(3).indices.tolist()
     )
+
+
+def test_draw_skips_prompts_too_long_for_the_context(tmp_path, models):
+    """A prompt that leaves < MIN_COMPLETION tokens of rollout.max_model_len is skipped (not a crash of the run); one
+    that fits gets at most the room that is left."""
+    from palingenesis.opd.trainer import MIN_COMPLETION, OPDTrainer
+
+    config = make_config(tmp_path, models)
+    config.set("rollout.max_model_len", 160, "test")
+    config.set("sources.math.max_new_tokens", 120, "test")
+    trainer = OPDTrainer(config)
+    long = [{"role": "user", "content": "word " * 400}]
+    short = [{"role": "user", "content": "What is 1 plus 2?"}]
+    draws = iter([(long, 120, {"_src": "math"}), (short, 120, {"_src": "math"})] * 20)
+    trainer.source.sample = lambda: next(draws)
+    requests = trainer._draw()
+    assert len(requests) == config.rollout.batch_prompts * config.rollout.group_size
+    assert trainer.skipped_long == config.rollout.batch_prompts
+    for r in requests:
+        assert len(r.prompt_ids) + r.max_new_tokens <= 160 and r.max_new_tokens >= MIN_COMPLETION

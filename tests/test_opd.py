@@ -461,6 +461,52 @@ def test_messages_source(tmp_path):
     assert source.batch_stats([({}, "whatever")]) == {}
 
 
+def test_messages_source_carries_tool_schemas(tmp_path):
+    """Rows with "tools": the schemas reach the rollout (meta) and the dev metrics; without tools, nothing changes."""
+    from palingenesis.opd.config import SourceConfig
+    from palingenesis.opd.formatting import encode_prompt
+    from palingenesis.opd.sources import ChatMessagesSource
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Weather in a city.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }
+    rows = [{"messages": [{"role": "user", "content": f"Meteo {i}?"}], "tools": [tool]} for i in range(6)]
+    config = SourceConfig(path=write_chat(tmp_path / "fc.jsonl", rows), dev_size=2, max_new_tokens=16)
+    source = ChatMessagesSource(config, eval_samples=2, seed=0, rng=random.Random(0))
+    _, _, meta = source.sample()
+    assert meta == {"tools": [tool]}
+
+    class ToolsEngine(FakeEngine):
+        def dev_kl(self, messages_list, max_new_tokens, tools_list=None):
+            self.calls.append(("dev_kl", tools_list))
+            return {"dev_kl": 0.5, "dev_len": 3.0}
+
+    engine = ToolsEngine()
+    source.evaluate(engine)
+    assert engine.calls == [("dev_kl", [[tool], [tool]])]
+
+    class Tok:  # records what the chat template receives
+        bos_token_id = None
+
+        def apply_chat_template(self, messages, tools=None, **kw):
+            self.tools = tools
+            return "x"
+
+        def encode(self, text, add_special_tokens=False):
+            return [1]
+
+    tok = Tok()
+    encode_prompt(tok, rows[0]["messages"], {}, [tool])
+    assert tok.tools == [tool]
+    encode_prompt(tok, rows[0]["messages"], {})
+    assert tok.tools is None
+
+
 def test_messages_source_dev_path_and_answers(tmp_path):
     """dev_path: the held-out set is another file (a test split); rows with answers get dev_acc."""
     from palingenesis.opd.config import SourceConfig
@@ -719,3 +765,44 @@ def test_rollout_max_num_seqs():
     assert rollout_max_num_seqs(config) == 2048
     config.rollout.max_num_seqs = 300
     assert rollout_max_num_seqs(config) == 300
+
+
+def test_messages_source_rows_carry_template_kwargs_and_may_end_on_tool_results(tmp_path):
+    """A row's chat_template_kwargs reach the prompt encoding over the model's (one mix of thinking and non-thinking
+    prompts), and a prompt may end on a tool result (a mid-episode agent state the student continues)."""
+    from palingenesis.opd.config import SourceConfig
+    from palingenesis.opd.orchestrator import Pipeline
+    from palingenesis.opd.sources import ChatMessagesSource
+
+    state = [{"role": "user", "content": "Luci?"},
+             {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}]},
+             {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'}]
+    rows = [{"messages": state, "chat_template_kwargs": {"enable_thinking": True}} for _ in range(3)]
+    rows += [{"messages": [{"role": "user", "content": f"Ciao {i}"}]} for i in range(3)]
+    rows += [{"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]}]  # skipped
+    config = SourceConfig(path=write_chat(tmp_path / "mix.jsonl", rows), dev_size=1, max_new_tokens=16)
+    source = ChatMessagesSource(config, eval_samples=1, seed=0, rng=random.Random(0))
+    assert len(source.train_rows) + len(source.dev_rows) == 6
+    metas = [source.sample()[2] for _ in range(40)]
+    assert {"chat_template_kwargs": {"enable_thinking": True}} in metas and {} in metas
+
+    seen = []
+
+    class Tok:
+        bos_token_id = None
+
+        def apply_chat_template(self, messages, tools=None, **kw):
+            seen.append(kw.get("enable_thinking"))
+            return "x"
+
+        def encode(self, text, add_special_tokens=False):
+            return [1]
+
+    class Route:
+        tokenizer = Tok()
+
+    pipe = Pipeline.__new__(Pipeline)
+    pipe.student_tok, pipe.routes, pipe.chat_template_kwargs = Tok(), {"t": Route()}, {"enable_thinking": False}
+    pipe.request(state, 16, {"chat_template_kwargs": {"enable_thinking": True}}, "s", "t")
+    pipe.request(state, 16, {}, "s", "t")
+    assert seen == [True, True, False, False]

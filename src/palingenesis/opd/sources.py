@@ -47,10 +47,14 @@ logger = logging.getLogger(__name__)
 class Engine(Protocol):
     """The trainer services a source may use during evaluate()."""
 
-    def greedy_generate(self, messages_list: list[list[dict[str, str]]], max_new_tokens: int) -> list[str]:
+    def greedy_generate(
+        self, messages_list: list[list[dict[str, str]]], max_new_tokens: int, tools_list: list | None = None
+    ) -> list[str]:
         """Greedy-decode one completion per conversation, stop token removed, decoded."""
 
-    def dev_kl(self, messages_list: list[list[dict[str, str]]], max_new_tokens: int) -> dict[str, float]:
+    def dev_kl(
+        self, messages_list: list[list[dict[str, str]]], max_new_tokens: int, tools_list: list | None = None
+    ) -> dict[str, float]:
         """Sample on-policy and teacher-score without grad: {"dev_kl": ..., "dev_len": ...}."""
 
 
@@ -151,9 +155,14 @@ class McqaPoolSource:
 
 
 class ChatMessagesSource:
-    """Generic chat prompts: JSONL of {"messages": [...], "answer"?: ...}, ending with a user turn.
+    """Generic chat prompts: JSONL of {"messages": [...], "tools"?: [...], "chat_template_kwargs"?: {...},
+    "answer"?: ...}, ending with a user turn or a tool result (a mid-episode agent state: the student
+    writes the next assistant turn). `tools` (OpenAI schemas) are rendered into the prompt by the chat
+    template, for student and teacher alike: function-calling prompts, where the student learns when and
+    how to call. A row's `chat_template_kwargs` override the model's for that prompt (e.g. one mix of
+    thinking and non-thinking prompts).
 
-    Rows whose last message is not a user turn are skipped (the student must
+    Rows whose last message is neither a user turn nor a tool result are skipped (the student must
     have something to complete).
     """
 
@@ -186,31 +195,43 @@ class ChatMessagesSource:
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                if row["messages"] and row["messages"][-1]["role"] == "user":
+                if row["messages"] and row["messages"][-1]["role"] in ("user", "tool"):
                     rows.append(row)
                 else:
                     skipped += 1
         if skipped:
-            logger.warning("Skipped %d rows of %s whose last message is not a user turn", skipped, path)
+            logger.warning("Skipped %d rows of %s whose last message is not a user turn or tool result", skipped, path)
         if not rows:
             raise ValueError(f"No usable rows in {path}")
         return rows
 
     def sample(self):
-        return self.rng.choice(self.train_rows)["messages"], self.config.max_new_tokens, {}
+        row = self.rng.choice(self.train_rows)
+        meta = {"tools": row["tools"]} if row.get("tools") else {}
+        if row.get("chat_template_kwargs"):
+            meta["chat_template_kwargs"] = row["chat_template_kwargs"]
+        return row["messages"], self.config.max_new_tokens, meta
 
     def evaluate(self, engine: Engine) -> dict[str, float]:
         rows = self.dev_rows[: self.eval_samples]
-        metrics = engine.dev_kl([r["messages"] for r in rows], self.config.max_new_tokens)
+        metrics = engine.dev_kl([r["messages"] for r in rows], self.config.max_new_tokens, **_tools_kw(rows))
         graded = [r for r in rows if "answer" in r]
         if graded:
-            texts = engine.greedy_generate([r["messages"] for r in graded], self.config.max_new_tokens)
+            texts = engine.greedy_generate(
+                [r["messages"] for r in graded], self.config.max_new_tokens, **_tools_kw(graded)
+            )
             correct = sum(_same_number(extract_number(t), str(r["answer"])) for r, t in zip(graded, texts))
             metrics["dev_acc"] = correct / len(graded)
         return metrics
 
     def batch_stats(self, rollouts):
         return {}
+
+
+def _tools_kw(rows: list[dict]) -> dict:
+    """tools_list for the engine when some rows carry tool schemas (engines without tools support still work)."""
+    tools = [r.get("tools") for r in rows]
+    return {"tools_list": tools} if any(tools) else {}
 
 
 def _same_number(pred: str | None, gold: str) -> bool:

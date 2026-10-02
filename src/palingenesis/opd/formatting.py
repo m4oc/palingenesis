@@ -39,10 +39,15 @@ ANSWER_NUMBER_RE = re.compile(r"Answer:\s*\$?(-?\d+(?:\.\d+)?)")
 NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
-def encode_prompt(tok, messages: list[dict[str, str]], chat_template_kwargs: dict | None = None) -> list[int]:
+def encode_prompt(
+    tok, messages: list[dict[str, str]], chat_template_kwargs: dict | None = None, tools: list[dict] | None = None
+) -> list[int]:
     """Token ids of `messages` rendered with the tokenizer's chat template, ready for
-    the assistant's turn (BOS prepended when the template leaves it out)."""
-    text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **(chat_template_kwargs or {}))
+    the assistant's turn (BOS prepended when the template leaves it out). `tools`: the
+    tool schemas the template lists in the prompt (function-calling prompts)."""
+    text = tok.apply_chat_template(
+        messages, tools=tools or None, add_generation_prompt=True, tokenize=False, **(chat_template_kwargs or {})
+    )
     ids = tok.encode(text, add_special_tokens=False)
     bos = tok.bos_token_id
     if bos is not None and (not ids or ids[0] != bos):
