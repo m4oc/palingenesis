@@ -295,7 +295,7 @@ class RLTrainer:
                     tools=static or row_tools(row, d.tools_field),
                     add_generation_prompt=True,
                     tokenize=False,
-                    **kwargs,
+                    **{**kwargs, **(row.get("chat_template_kwargs") or {})},
                 )
                 for row in train
             ]

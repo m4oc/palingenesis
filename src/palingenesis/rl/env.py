@@ -13,11 +13,23 @@ An environment is any class. Per trajectory, the trainer takes an instance from 
         a crash).
     get_reward(self[, messages]) -> float | dict | None  optional, sync or async
         An environment-owned reward, logged as "env" and added with weight 1 (a dict of
-        components is logged as env/<name>, each added). With a parameter it receives the
-        conversation, to verify from the transcript.
+        components is logged as env/<name>, each added; a component named "metric/<name>"
+        is only logged, e.g. {"correct": 1.0, "metric/abstained": 0.0}). A component's logged
+        mean is over the trajectories that report it: report every component on every
+        trajectory (0 when it does not apply), or a penalty present only when it fires reads
+        as a 100% rate. With a parameter it receives the conversation, to verify from the transcript.
     close(self)                                          optional, sync or async
     done                                                 optional attribute
         Set it to True (e.g. in a submit tool) to end the episode after this turn's tools.
+
+Text-protocol environments (tools described in the system prompt in a custom format — XML tags, ReAct lines, JSON
+actions — rather than native function calling) add two optional methods:
+
+    text_actions(self, content) -> list[(name, arguments)] | None   parse actions from the assistant's text
+    observation_text(self, results) -> str                           the next user turn from [(name, output), ...]
+
+When the policy writes no native tool call, text_actions() is asked; its actions run like tool calls and their
+results come back as one user message (observation_text, or the outputs joined). No actions ends the episode.
 
 Tools that are not Python methods (HTTP routes, OpenEnv; MCP servers: palingenesis.rl.envs.mcp) come from two
 optional methods instead, read after reset() so they may depend on the episode:
@@ -67,7 +79,8 @@ from palingenesis.rl.chat import tool_schema
 
 logger = logging.getLogger(__name__)
 
-_LIFECYCLE = ("reset", "get_reward", "close", "aclose", "tool_schemas", "call_tool", "tools")
+_LIFECYCLE = ("reset", "get_reward", "close", "aclose", "tool_schemas", "call_tool", "tools", "text_actions",
+              "observation_text")
 
 
 class ToolFailed(Exception):

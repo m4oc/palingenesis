@@ -227,6 +227,60 @@ def test_dynamic_tools_and_environment_ended_episode():
     assert "submit" in tok.decode(t.prompt_ids)  # the dynamic schema reached the prompt
 
 
+class _ScoredWithMetrics(Submission):
+    def get_reward(self):
+        ok = float(self.answer == "5")
+        return {"correct": ok, "wrong": ok - 1.0, "metric/answered": 1.0}
+
+
+def test_environment_metric_components_are_logged_not_added():
+    """A get_reward component named metric/<name> is logged with the rewards but is not part of the reward."""
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from tests.test_rl import ScriptedEngine, tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    eot = end_of_turn_id(tok, kwargs)
+    engine = ScriptedEngine(tok, eot, ['<tool_call>\n{"name": "submit", "arguments": {"answer": "5"}}\n</tool_call>'])
+    config = RLConfig()
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 2,
+        "rollout.max_new_tokens": 64,
+        "rollout.max_model_len": 4096,
+    }.items():
+        config.set(key, value)
+    rows = [{"prompt": "What is 2 + 3? Submit it."}]
+    pipeline = RLPipeline(
+        tok,
+        ChatFormat(tok, eot, kwargs),
+        engine,
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        PromptSampler(rows),
+        [],
+        EnvPool(_ScoredWithMetrics),
+        None,
+        (eot,),
+    )
+    try:
+        (group,) = pipeline._await(pipeline._eval(rows, 1.0))
+    finally:
+        pipeline.close()
+    t = group[0]
+    assert t.rewards == {"env/correct": 1.0, "env/wrong": 0.0, "env/metric/answered": 1.0}
+    assert t.reward == 1.0  # the metric is not added
+
+
 def test_openenv_adapter_in_process():
     pytest.importorskip("openenv")
     echo = pytest.importorskip("echo_env.server.echo_environment")
@@ -405,3 +459,62 @@ def test_partial_rollouts_continue_into_the_next_batch():
     finally:
         pipeline.close()
     assert not pipeline.continuing
+
+
+class _TagProtocol:
+    """Tools described in the prompt as tags: <lookup>key</lookup>; observations come back as <result>...</result>."""
+
+    def reset(self, **row):
+        self.seen = []
+
+    def tool_schemas(self):
+        return []
+
+    def call_tool(self, name, arguments):
+        self.seen.append(arguments["key"])
+        return {"capital": "Rome"}.get(arguments["key"], "unknown")
+
+    def text_actions(self, content):
+        import re
+
+        return [("lookup", {"key": k.strip()}) for k in re.findall(r"<lookup>(.*?)</lookup>", content, re.S)]
+
+    def observation_text(self, results):
+        return "\n".join(f"<result>{out}</result>" for _, out in results)
+
+    def get_reward(self, messages):
+        final = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
+        return float(self.seen == ["capital"] and "Rome" in final)
+
+
+def test_text_protocol_environment_runs_actions_from_text():
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from tests.test_rl import ScriptedEngine, tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    eot = end_of_turn_id(tok, kwargs)
+    engine = ScriptedEngine(tok, eot, ["<lookup>capital</lookup>", "The capital is Rome.", "never"])
+    config = RLConfig()
+    for key, value in {"model.policy": "x", "model.chat_template_kwargs": kwargs, "env.max_turns": 4,
+                       "rollout.max_new_tokens": 64, "rollout.max_model_len": 4096}.items():
+        config.set(key, value)
+    rows = [{"prompt": "Use <lookup>key</lookup> to look things up. What is the capital?"}]
+    pipeline = RLPipeline(tok, ChatFormat(tok, eot, kwargs), engine, PublishedWeights(torch.nn.Linear(1, 1)), config,
+                          PromptSampler(rows), [], EnvPool(_TagProtocol), None, (eot,))
+    try:
+        (group,) = pipeline._await(pipeline._eval(rows, 1.0))
+    finally:
+        pipeline.close()
+    t = group[0]
+    assert t.finish == "stop" and t.turns == 2 and t.reward == 1.0
+    roles = [m["role"] for m in t.messages]
+    assert roles[-3:] == ["assistant", "user", "assistant"] and "<result>Rome</result>" in t.messages[-2]["content"]

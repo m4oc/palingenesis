@@ -13,6 +13,7 @@ parse_assistant     an assistant turn's text split into reasoning, content and t
 tool_schema         OpenAI function schema from a Python callable's type hints and docstring
 """
 
+import copy
 import inspect
 import json
 import re
@@ -59,6 +60,10 @@ class ChatFormat:
         self.eot_text = tok.decode([eot_id])
         self.kwargs = chat_template_kwargs or {}
         self.think_tags = think_tags
+        # enable_thinking=False: the generation prompt already closes an empty think block, so nothing the
+        # policy writes is reasoning. A think tag it emits anyway stays in the content, where rewards see it
+        # (split off as reasoning, it hid text from graders: an RL policy learned to list guesses behind "</think>").
+        self.thinking = self.kwargs.get("enable_thinking", True) is not False
         # Control-token strings a tool result must not smuggle into the context: the special
         # tokens and every added token (<tool_call>, <think>, ... are added but not special).
         added = getattr(tok, "added_tokens_decoder", None) or {}
@@ -68,6 +73,16 @@ class ChatFormat:
             key=len,
             reverse=True,
         )
+
+    def with_kwargs(self, row_kwargs: dict | None) -> "ChatFormat":
+        """This format with a row's own template kwargs over the model's (e.g. one RL mix of thinking and
+        non-thinking rows: {"enable_thinking": true} on some rows). Shares the tokenizer; cheap."""
+        if not row_kwargs:
+            return self
+        view = copy.copy(self)
+        view.kwargs = {**self.kwargs, **row_kwargs}
+        view.thinking = view.kwargs.get("enable_thinking", True) is not False
+        return view
 
     def continuation_ids(
         self,
@@ -117,9 +132,10 @@ class ChatFormat:
 
     def split_reasoning(self, text: str) -> tuple[str, str]:
         """(reasoning, rest): the text up to the closing think tag is reasoning. The opening
-        tag may be in the prompt (Qwen3.5's generation prompt ends with it)."""
+        tag may be in the prompt (Qwen3.5's generation prompt ends with it). With thinking
+        disabled everything is content."""
         open_tag, close_tag = self.think_tags
-        if close_tag not in text:
+        if not self.thinking or close_tag not in text:
             return "", text
         head, rest = text.split(close_tag, 1)
         return head.replace(open_tag, "", 1).strip(), rest.strip()

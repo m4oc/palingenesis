@@ -26,7 +26,7 @@ from typing import Any
 
 from palingenesis.opd.orchestrator import PublishedWeights
 from palingenesis.opd.rollout import RolloutEngine
-from palingenesis.rl.chat import ChatFormat, encode_prompt, parse_assistant
+from palingenesis.rl.chat import ChatFormat, ToolCall, encode_prompt, parse_assistant
 from palingenesis.rl.config import RLConfig
 from palingenesis.rl.data import PromptSampler, prompt_messages
 from palingenesis.rl.env import EnvPool, call_sync_or_async, row_tools, run_tool
@@ -239,13 +239,17 @@ class RLPipeline:
             schemas = await self.env_pool.episode_schemas(env) if env is not None else None
             schemas = schemas or row_tools(row, config.data.tools_field)
             by_name = {s["function"]["name"]: s for s in schemas or []}
-            trajectory.prompt_ids = encode_prompt(self.tok, messages, schemas, config.model.chat_template_kwargs)
-            budget = config.completion_budget
+            # a row may carry its own template kwargs (thinking or not) and generation budgets
+            chat = self.chat.with_kwargs(row.get("chat_template_kwargs"))
+            trajectory.prompt_ids = encode_prompt(self.tok, messages, schemas, chat.kwargs)
+            budget = int(row.get("max_completion_tokens") or config.completion_budget)
+            row_new_tokens = int(row.get("max_new_tokens") or r.max_new_tokens)
+            trajectory.info["budget"] = budget
             max_turns = 1 if env is None else e.max_turns
             for turn in range(max_turns):
                 context = len(trajectory.prompt_ids) + len(trajectory.tokens)
                 room = min(
-                    r.max_new_tokens,
+                    row_new_tokens,
                     budget - trajectory.sampled_tokens,
                     r.max_model_len - context,
                 )
@@ -262,11 +266,18 @@ class RLPipeline:
                     [t for t in out.ids if t not in self.stop_ids],
                     skip_special_tokens=True,
                 )
-                parsed = parse_assistant(text, self.chat, e.tool_parser, by_name, f"call_{turn}")
+                parsed = parse_assistant(text, chat, e.tool_parser, by_name, f"call_{turn}")
                 trajectory.messages.append(parsed.message())
                 if out.finish == "length":
                     trajectory.finish = "length"
                     break
+                # text-protocol environments (tools described in the prompt as tags, ReAct lines, JSON actions...):
+                # the environment parses actions from the assistant's text and answers in a user turn
+                text_protocol = False
+                if env is not None and not (parsed.calls or parsed.errors) and hasattr(env, "text_actions"):
+                    actions = await call_sync_or_async(env.text_actions, parsed.content) or []
+                    parsed.calls = [ToolCall(name, dict(args or {}), f"call_{turn}_{k}") for k, (name, args) in enumerate(actions)]
+                    text_protocol = bool(parsed.calls)
                 if env is None or not (parsed.calls or parsed.errors):
                     trajectory.finish = "stop"
                     break
@@ -274,8 +285,9 @@ class RLPipeline:
                     trajectory.finish = "turns"
                     break
                 t_tools = clock()
-                results = await asyncio.gather(
-                    *(run_tool(env, c.name, c.arguments, e.tool_timeout, set(by_name)) for c in parsed.calls)
+                results = await asyncio.gather(  # text-protocol actions are validated by the environment itself
+                    *(run_tool(env, c.name, c.arguments, e.tool_timeout, None if text_protocol else set(by_name))
+                      for c in parsed.calls)
                 )
                 turn_timing["tools_s"] = clock() - t_tools
                 observations = [
@@ -288,6 +300,11 @@ class RLPipeline:
                     for c, (text, _) in zip(parsed.calls, results)
                 ]
                 observations += [{"role": "tool", "content": error} for error in parsed.errors]
+                if text_protocol:  # one user turn with the results, in the environment's own format
+                    render = getattr(env, "observation_text", None)
+                    body = render([(c.name, out_text) for c, (out_text, _) in zip(parsed.calls, results)]) if render \
+                        else "\n\n".join(out_text for out_text, _ in results)
+                    observations = [{"role": "user", "content": body}]
                 for o in observations:
                     o["content"] = self.chat.truncate(self.chat.sanitize(o["content"]), e.max_tool_output_tokens)
                 trajectory.tool_calls += len(parsed.calls)
@@ -296,7 +313,7 @@ class RLPipeline:
                     trajectory.messages.extend(observations)
                     trajectory.finish = "env_done"
                     break
-                context_ids = self.chat.continuation_ids(observations, schemas, parsed.calls)
+                context_ids = chat.continuation_ids(observations, schemas, None if text_protocol else parsed.calls)
                 if out.ids and out.ids[-1] != self.chat.eot_id:  # the turn ended on another stop token
                     context_ids = [self.chat.eot_id] + context_ids
                 if len(trajectory.prompt_ids) + len(trajectory.tokens) + len(context_ids) >= r.max_model_len - 1:
@@ -380,13 +397,16 @@ class RLPipeline:
                 t.rewards = {n: (None if v is SKIPPED else v) for n, v in values.items()}
                 continue
             t.rewards = values
-            applicable = [(weights.get(n, 1.0), v) for n, v in values.items() if v is not None]
+            # env/metric/<name>: an environment's statistic, logged with the rewards but not part of the reward
+            applicable = [
+                (weights.get(n, 1.0), v) for n, v in values.items() if v is not None and not n.startswith("env/metric/")
+            ]
             if not applicable:
                 t.scored = t.trained = False
                 continue
             t.reward = sum(w * v for w, v in applicable)
             if loss.overlong_buffer:
-                over = t.sampled_tokens - (budget - loss.overlong_buffer)
+                over = t.sampled_tokens - (t.info.get("budget", budget) - loss.overlong_buffer)
                 if over > 0:
                     penalty = loss.overlong_penalty * min(1.0, over / loss.overlong_buffer)
                     t.rewards["overlong"] = -penalty

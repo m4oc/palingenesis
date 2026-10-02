@@ -194,6 +194,21 @@ def test_tool_calls_parse_and_render_token_exact():
     )
     assert tok.decode(prompt + generated + context) == reference  # token-in/token-out == the template
 
+    # thinking disabled: the prompt closed the think block, so a think tag the policy writes is content (rewards
+    # must see it; split off as reasoning it hid a list of guesses from the grader)
+    plain = ChatFormat(tok, end_of_turn_id(tok, {"enable_thinking": False}), {"enable_thinking": False})
+    hidden = parse_assistant("Lisbon\n</think>\n Porto\n</think>\n Madrid", plain)
+    assert hidden.reasoning == "" and "Lisbon" in hidden.content and "Madrid" in hidden.content
+
+    # per-row thinking in a non-thinking run (one RL mix of both modes): the row's view renders, splits and continues
+    # exactly like a native thinking format, and the run's own format stays non-thinking
+    row_view = plain.with_kwargs({"enable_thinking": True})
+    assert row_view.thinking and not plain.thinking and plain.with_kwargs(None) is plain
+    assert encode_prompt(tok, messages, tools, row_view.kwargs) == prompt
+    row_turn = parse_assistant(text, row_view, "auto", {"python": tools[0]})
+    assert row_turn.reasoning == "let me run it" and row_turn.content == "Running it."
+    assert row_view.continuation_ids(observation, tools, row_turn.calls) == context
+
     hermes = parse_assistant('<tool_call>\n{"name": "python", "arguments": {"code": "x"}}\n</tool_call>', chat)
     assert hermes.calls[0].arguments == {"code": "x"}
     broken = parse_assistant("<tool_call>\n{not json}\n</tool_call>", chat)
