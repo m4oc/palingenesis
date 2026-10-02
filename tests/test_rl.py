@@ -672,3 +672,87 @@ def test_streaming_generation_resolves_each_turn_when_it_finishes():
     assert asyncio.run(main()).ids == [2]
     client.close()
     assert not client.thread.is_alive() and time.time() - start < 10
+
+
+# --------------------------------------------------------------------- run diagnostics (KL, pass@k, families)
+
+
+def test_kl_k3_and_row_family():
+    from palingenesis.rl.pipeline import row_family
+    from palingenesis.rl.reference import kl_k3
+
+    lp = torch.tensor([-1.0, -2.0, -0.5])
+    assert torch.allclose(kl_k3(lp, lp), torch.zeros(3))
+    assert (kl_k3(lp, torch.tensor([-1.5, -1.0, -3.0])) > 0).all()
+    keys = ["vtask.vtype", "task"]
+    assert row_family({"task": "vtask", "vtask": {"vtype": "mc_math"}}, keys) == "mc_math"
+    assert row_family({"task": "vtask", "vtask": json.dumps({"vtype": "fmt_list"})}, keys) == "fmt_list"  # JSON string
+    assert row_family({"task": "agent"}, keys) == "agent" and row_family({}, keys) == "other"
+
+
+def test_outcome_stats_cover_every_group_and_family():
+    """pass@1 / pass@G / reward_all over all finished groups (not only the informative ones that train)."""
+    from types import SimpleNamespace
+
+    from palingenesis.rl.pipeline import RLPipeline
+
+    def traj(family, reward):
+        return Trajectory(row={"task": family}, group=0, prompt_ids=[1], messages=[], tokens=[5, 6], mask=[True, True],
+                          logprobs=[-0.5, -1.5], reward=reward)
+
+    groups = [[traj("a", 1.0), traj("a", 1.0)], [traj("a", 0.0), traj("a", 0.0)], [traj("b", 1.0), traj("b", 0.0)]]
+    fake = SimpleNamespace(config=SimpleNamespace(data=SimpleNamespace(success_threshold=0.5, metrics_key=["task"]),
+                                                  rollout=SimpleNamespace(group_size=2)))
+    out = RLPipeline._outcome_stats(fake, groups)
+    assert out["outcome/pass@1"] == 0.5 and out["outcome/pass@2"] == 2 / 3 and out["outcome/surprisal"] == 1.0
+    assert out["family/a/pass@1"] == 0.5 and out["family/a/pass@2"] == 0.5 and out["family/b/pass@2"] == 1.0
+
+
+def test_trainer_logs_kl_to_reference_and_families(tmp_path):
+    from palingenesis.rl.trainer import RLTrainer
+
+    rows = [{"prompt": f"What is {i} plus {i + 1}?", "answer": str(2 * i + 1), "kind": "odd" if i % 2 else "even"} for i in range(20)]
+    (tmp_path / "data.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    config = RLConfig()
+    for key, value in {
+        "model.policy": tiny_policy(tmp_path),
+        "model.use_liger_kernel": False,
+        "model.chat_template_kwargs": {"enable_thinking": False},
+        "data.dataset": str(tmp_path / "data.jsonl"),
+        "data.metrics_key": ["kind"],
+        "data.success_threshold": 0.3,
+        "rollout.backend": "hf",
+        "rollout.batch_prompts": 3,
+        "rollout.group_size": 3,
+        "rollout.max_new_tokens": 8,
+        "rewards.m.fn": "math",
+        "rewards.m.weight": 0.0,
+        "train.output_dir": str(tmp_path / "run"),
+        "train.steps": 2,
+        "train.learning_rate": 1e-3,
+        "train.warmup_steps": 1,
+        "loss.kl_ref": "start",
+        "loss.kl_coef": 0.1,
+        "loss.kl_ref_reset": 1,
+    }.items():
+        config.set(key, value)
+    trainer = RLTrainer(config, rewards=[lambda completion: len(completion) / 40])
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append((kind, dict(metrics)))
+    trainer.train()
+    steps = [m for kind, m in logged if kind == "step"]
+    assert steps and all("policy/kl_ref" in m and m["policy/kl_ref"] >= 0 for m in steps)
+    assert all("outcome/pass@1" in m and "outcome/pass@3" in m for m in steps)
+    assert any(k.startswith("family/odd/") or k.startswith("family/even/") for k in steps[0])
+    # a reset every step: the reference equals the policy after the last step
+    ref = dict(trainer.reference.model.named_parameters())
+    for name, p in trainer.model.named_parameters():
+        assert torch.allclose(ref[name].float(), p.detach().float(), atol=1e-2), name
+
+
+def test_kl_options_are_validated():
+    config = RLConfig()
+    config.set("loss.kl_coef", 0.1)
+    config.set("data.dataset", "x.jsonl")
+    with pytest.raises(RLConfigError, match="kl_ref"):
+        config.validate(python_rewards=True)

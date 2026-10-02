@@ -16,6 +16,7 @@ engine is never touched while the trainer updates the weights it loads.
 import asyncio
 import inspect
 import itertools
+import json
 import logging
 import math
 import threading
@@ -153,9 +154,12 @@ class RLPipeline:
         self.rollout_start = asyncio.get_running_loop().time()
         dumping = bool(self.config.logging.dump_trajectories)
 
+        finished: list[list[Trajectory]] = []  # every finished group (kept or not): unbiased pass@k / family stats
+
         def account(group: list[Trajectory]) -> bool:
             nonlocal dropped_tokens
             counts["groups"] += 1
+            finished.append(group)
             if group_is_informative(group):
                 return True
             counts["zero_variance"] += 1
@@ -187,6 +191,7 @@ class RLPipeline:
         if counts["groups"]:
             self.drop_rate = 0.5 * self.drop_rate + 0.5 * counts["zero_variance"] / counts["groups"]
         stats = self._group_stats([t for g in kept for t in g])
+        stats.update(self._outcome_stats(finished))
         stats.update(
             {
                 "groups/launched": launched,
@@ -475,6 +480,40 @@ class RLPipeline:
         stats.update({f"rewards/{name}": sum(v) / len(v) for name, v in per_reward.items()})
         return stats
 
+    def _outcome_stats(self, groups: list[list[Trajectory]]) -> dict[str, float]:
+        """Over every finished group, kept or not (the "reward" above covers only the informative groups that train,
+        whose mix shifts as groups saturate): reward_all, pass@1 (share of rollouts at or above
+        data.success_threshold), pass@G (share of groups with at least one such rollout: falling pass@G under rising
+        pass@1 is the sharpening signature) and surprisal (mean -log p of sampled tokens, an entropy proxy). With
+        data.metrics_key, the same per family as family/<name>/<metric>."""
+        groups = [[t for t in g if t.scored] for g in groups]
+        groups = [g for g in groups if g]
+        if not groups:
+            return {}
+        d = self.config.data
+        threshold = d.success_threshold
+
+        def summarize(gs: list[list[Trajectory]]) -> dict[str, float]:
+            ts = [t for g in gs for t in g]
+            sampled = [lp for t in ts for lp, m in zip(t.logprobs, t.mask) if m]
+            return {
+                "reward_all": sum(t.reward for t in ts) / len(ts),
+                "pass@1": sum(t.reward >= threshold for t in ts) / len(ts),
+                f"pass@{self.config.rollout.group_size}": sum(any(t.reward >= threshold for t in g) for g in gs) / len(gs),
+                "surprisal": -sum(sampled) / max(1, len(sampled)),
+                "completion_len": sum(t.sampled_tokens for t in ts) / len(ts),
+                "groups": float(len(gs)),
+            }
+
+        out = {f"outcome/{k}": v for k, v in summarize(groups).items() if k != "completion_len"}
+        if d.metrics_key:
+            by: dict[str, list[list[Trajectory]]] = defaultdict(list)
+            for g in groups:
+                by[row_family(g[0].row, d.metrics_key)].append(g)
+            for family, gs in by.items():
+                out.update({f"family/{family}/{k}": v for k, v in summarize(gs).items()})
+        return out
+
     # --------------------------------------------------------------- evaluation
 
     def evaluate(self, rows: list[dict], temperature: float) -> dict[str, float]:
@@ -534,3 +573,21 @@ def _timeline_stats(timeline: list[tuple[float, int, int]]) -> dict[str, float]:
         "engine/tail_s": times[-1] - tail_start,
         "engine/step_ms": 1000 * span / (len(timeline) - 1),
     }
+
+
+def row_family(row: dict, keys: list[str]) -> str:
+    """The first of `keys` (dotted paths; a JSON-string field is parsed) present in `row`, else "other"."""
+    for key in keys:
+        value: Any = row
+        for part in key.split("."):
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    value = None
+            value = value.get(part) if isinstance(value, dict) else None
+            if value is None:
+                break
+        if value is not None and not isinstance(value, (dict, list)):
+            return str(value)
+    return "other"

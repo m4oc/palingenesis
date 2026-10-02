@@ -195,6 +195,14 @@ class RLTrainer:
         self.master = MasterWeights(self.model) if not fsdp and self.device.startswith("cuda") else None
         self.head = output_head(self.model)
         self.head_weight = LowPrecisionWeight()  # bf16 copy of the head, cast once per optimizer step
+        self.reference = None
+        if config.loss.kl_ref:
+            from palingenesis.rl.reference import ReferencePolicy
+
+            ref_path = m.policy if config.loss.kl_ref == "start" else config.loss.kl_ref
+            self.reference = ReferencePolicy(ref_path, self.device, self.pad_id, t.micro_tokens)
+            logger.info("KL reference: %s (kl_coef %g, reset every %d steps)", ref_path, config.loss.kl_coef,
+                        config.loss.kl_ref_reset)
 
         if r.backend == "hf":
             self.engine = HFRollout(self.model, self.stop_ids, self.pad_id, r.micro_seqs)
@@ -358,6 +366,8 @@ class RLTrainer:
         )
         trajectories = [t for g in groups for t in g if id(t) in weights]
         totals: dict[str, torch.Tensor] = {}
+        reference = getattr(self, "reference", None)
+        self.ref_lp = reference.logprobs(trajectories) if reference is not None and trajectories else {}
         if self._share_prompts(groups):
             trajectories = self._train_trees(groups, weights, totals)  # the rest: groups too small to share
         micro_batches: list[list[Trajectory] | None] = list(self._micro_batches(trajectories))
@@ -392,6 +402,8 @@ class RLTrainer:
                 hidden = final_hidden_states(self.model, ids, None)[positions.to(device, non_blocking=True)]
             lp, entropy = target_logprobs(hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight)
             loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config)
+            if self.ref_lp:
+                loss = self._kl_term(loss, stats, lp, torch.cat([self.ref_lp[id(t)] for t in micro]), floats[2])
             loss.backward()
             _accumulate(totals, stats, loss, entropy)
         if not totals:
@@ -412,7 +424,20 @@ class RLTrainer:
         }
         if "entropy" in values:
             metrics["policy/entropy"] = values["entropy"] / tokens
+        if "kl_ref" in values:
+            metrics["policy/kl_ref"] = values["kl_ref"] / tokens
+            metrics["policy/kl_ref_max"] = values["kl_ref_max"]
         return metrics
+
+    def _kl_term(self, loss: torch.Tensor, stats: dict, lp: torch.Tensor, ref_lp: torch.Tensor, weight: torch.Tensor):
+        """Log the per-token k3 KL to the reference; with loss.kl_coef > 0 add it with the policy loss's weights."""
+        from palingenesis.rl.reference import kl_k3
+
+        kl = kl_k3(lp, ref_lp)
+        stats["kl_ref"] = kl.detach().sum()
+        stats["kl_ref_max"] = kl.detach().max()
+        coef = self.config.loss.kl_coef
+        return loss + coef * (kl * weight).sum() if coef > 0 else loss
 
     def _share_prompts(self, groups: list[list[Trajectory]]) -> bool:
         mode = self.config.train.prompt_sharing
@@ -460,6 +485,8 @@ class RLTrainer:
                 seq = torch.zeros(len(sampled), dtype=torch.long, device=device)
                 seq_len = torch.tensor([float(len(sampled))], device=device)
                 loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config)
+                if self.ref_lp:
+                    loss = self._kl_term(loss, stats, lp, self.ref_lp[id(t)], floats[2])
                 _accumulate(totals, stats, loss, entropy)
                 return loss
 
@@ -501,6 +528,7 @@ class RLTrainer:
             if t.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)
             start_time = time.time()
+            t_loss = self.config.loss
             for step in range(self.start_step, t.steps):
                 t0 = time.perf_counter()
                 batch: RLBatch = self.orchestrator.next(self.weights.version)
@@ -520,6 +548,9 @@ class RLTrainer:
                         if self.master is not None:
                             self.master.publish()
                     self.opt.zero_grad(set_to_none=True)
+                    if self.reference is not None and t_loss.kl_ref_reset and (step + 1) % t_loss.kl_ref_reset == 0:
+                        self.reference.reset_to(self.model)
+                        logger.info("KL reference reset to the policy at step %d", step + 1)
                     if self.device.startswith("cuda"):
                         torch.cuda.synchronize()
                 train_time = time.perf_counter() - t1

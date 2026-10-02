@@ -68,6 +68,11 @@ class RLDataConfig:
     # Retire a prompt once its running mean reward reaches this (0 = never). With a 0/1
     # reward, 0.9 retires prompts the policy has learned (ScaleRL's no-positive-resampling).
     retire_above: float = 0.0
+    # Rollout outcome metrics (pipeline._outcome_stats): a rollout counts as a success at or above this reward
+    # (pass@1 / pass@G), and metrics_key (dotted row paths, first present wins, e.g. ["vtask.vtype", "task"]) splits
+    # them per family as family/<name>/... (empty: global only).
+    success_threshold: float = 0.5
+    metrics_key: list = field(default_factory=list)
     seed: int = 0
 
 
@@ -191,6 +196,13 @@ class RLLossConfig:
     overlong_buffer: int = 0
     overlong_penalty: float = 1.0
     log_entropy: bool = True
+    # KL to a frozen reference (palingenesis.rl.reference): "" = off, "start" = the policy as loaded at step 0 (the
+    # model.policy checkpoint), or a checkpoint path. Logged every step as policy/kl_ref (per-token k3 estimator);
+    # kl_coef > 0 also adds it to the loss with the policy loss's token weights; kl_ref_reset > 0 resets the reference
+    # to the current policy every N steps (ProRL 2505.24864). Not with FSDP.
+    kl_ref: str = ""
+    kl_coef: float = 0.0
+    kl_ref_reset: int = 0
 
 
 @dataclass(slots=True)
@@ -478,6 +490,12 @@ class RLConfig:
             )
         if loss.truncation not in TRUNCATION:
             errors.append(f"loss.truncation must be one of {TRUNCATION}, got {loss.truncation!r}.")
+        if loss.kl_coef < 0 or loss.kl_ref_reset < 0:
+            errors.append("loss.kl_coef and loss.kl_ref_reset must be >= 0.")
+        if (loss.kl_coef > 0 or loss.kl_ref_reset > 0) and not loss.kl_ref:
+            errors.append('loss.kl_coef / kl_ref_reset need loss.kl_ref ("start" or a checkpoint).')
+        if loss.kl_ref and self.train.fsdp:
+            errors.append("loss.kl_ref is not supported with train.fsdp yet.")
         if not 0 < loss.eps_low < 1 or loss.eps_high <= 0:
             errors.append("loss.eps_low must be in (0, 1) and loss.eps_high > 0.")
         if loss.is_cap < 1:
