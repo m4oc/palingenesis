@@ -19,8 +19,9 @@ from palingenesis.rl.losses import target_logprobs
 
 
 class ReferencePolicy:
-    def __init__(self, path: str, device: str, pad_id: int, micro_tokens: int):
+    def __init__(self, path: str, device: str, pad_id: int, micro_tokens: int, temperature: float = 1.0):
         self.path = path
+        self.inv_temperature = 1.0 / temperature  # scored like the policy: logits / rollout.temperature
         self.device = device
         self.pad_id = pad_id
         self.micro_tokens = micro_tokens
@@ -50,7 +51,7 @@ class ReferencePolicy:
                 counts.append(len(sampled))
             with torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16, enabled=self.device.startswith("cuda")):
                 hidden = final_hidden_states(self.model, ids, None)[positions.to(self.device)]
-            lp, _ = target_logprobs(hidden.float(), self.head, torch.tensor(targets, device=self.device))
+            lp, _ = target_logprobs(hidden.float() * self.inv_temperature, self.head, torch.tensor(targets, device=self.device))
             for t, piece in zip(micro, torch.split(lp.detach(), counts)):
                 out[id(t)] = piece
         return out

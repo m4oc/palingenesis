@@ -813,3 +813,52 @@ def test_kl_options_are_validated():
     config.set("data.dataset", "x.jsonl")
     with pytest.raises(RLConfigError, match="kl_ref"):
         config.validate(python_rewards=True)
+
+
+@pytest.mark.parametrize("sharing", ["off", "on"])
+def test_trained_policy_is_the_sampled_one_at_any_temperature(sharing):
+    """vLLM samples and reports behaviour log-probs at rollout.temperature; the trainer must score logits / T, so
+    on-policy importance ratios are exactly 1 (they were not before: an unscaled policy against a scaled sampler)."""
+    import random as _random
+
+    from test_seco import MODELS
+
+    from palingenesis.logits import final_hidden_states, output_head
+    from palingenesis.rl.losses import LowPrecisionWeight
+    from palingenesis.rl.parallel import Parallel
+    from palingenesis.rl.trainer import RLTrainer
+
+    temperature = 0.7
+    model = MODELS["gpt2"]()
+    head = output_head(model)
+
+    def behaviour(prompt, tokens):  # log-probs of the scaled distribution, as vLLM's processed_logprobs
+        with torch.no_grad():
+            ids = torch.tensor([prompt + tokens[:-1]])
+            logits = head(final_hidden_states(model, ids, None))[0, len(prompt) - 1 :] / temperature
+            return torch.log_softmax(logits.double(), -1).gather(1, torch.tensor(tokens)[:, None]).squeeze(1).tolist()
+
+    rng = _random.Random(0)
+    groups = []
+    for g in range(2):
+        prompt = [rng.randrange(1, 90) for _ in range(8)]
+        group = []
+        for _ in range(3):
+            tokens = [rng.randrange(1, 90) for _ in range(6)]
+            t = Trajectory({}, g, prompt, [], tokens=tokens, mask=[True] * 6, logprobs=behaviour(prompt, tokens))
+            t.reward = rng.random()
+            group.append(t)
+        groups.append(group)
+
+    def ratio_dev(inv_t):
+        trainer = object.__new__(RLTrainer)
+        trainer.config = RLConfig()
+        trainer.config.set("train.prompt_sharing", sharing)
+        trainer.parallel, trainer.device, trainer.pad_id = Parallel(fsdp=False), "cpu", 0
+        trainer.model, trainer.head, trainer.head_weight = model, head, LowPrecisionWeight()
+        trainer.inv_temperature = inv_t
+        model.zero_grad()
+        return trainer._train_step(groups)["policy/abs_ratio_dev"]
+
+    assert ratio_dev(1.0 / temperature) < 1e-5  # the trained policy is the sampled one
+    assert ratio_dev(1.0) > 1e-2  # the old behaviour: unscaled policy vs scaled sampler

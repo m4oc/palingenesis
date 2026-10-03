@@ -195,12 +195,22 @@ class RLTrainer:
         self.master = MasterWeights(self.model) if not fsdp and self.device.startswith("cuda") else None
         self.head = output_head(self.model)
         self.head_weight = LowPrecisionWeight()  # bf16 copy of the head, cast once per optimizer step
+        # The policy is the one that samples: vLLM samples (and reports behaviour log-probs) at rollout.temperature,
+        # so the trainer scores logits / T. With a plain linear head logits / T = W (h / T): the hidden state is scaled,
+        # which every head kernel supports. Before, T != 1 compared an unscaled policy with a scaled sampler.
+        self.inv_temperature = 1.0 / config.rollout.temperature
+        if self.inv_temperature != 1.0 and not _plain_linear(self.head):
+            raise RLConfigError(
+                f"rollout.temperature={config.rollout.temperature} needs a plain linear output head (no bias, no logit "
+                "multiplier or soft-capping) so that the trained policy is the sampled one; use temperature 1."
+            )
         self.reference = None
         if config.loss.kl_ref:
             from palingenesis.rl.reference import ReferencePolicy
 
             ref_path = m.policy if config.loss.kl_ref == "start" else config.loss.kl_ref
-            self.reference = ReferencePolicy(ref_path, self.device, self.pad_id, t.micro_tokens)
+            self.reference = ReferencePolicy(ref_path, self.device, self.pad_id, t.micro_tokens,
+                                             temperature=config.rollout.temperature)
             logger.info("KL reference: %s (kl_coef %g, reset every %d steps)", ref_path, config.loss.kl_coef,
                         config.loss.kl_ref_reset)
 
@@ -400,6 +410,9 @@ class RLTrainer:
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 # right-padded rows need no mask: padding comes after every position scored
                 hidden = final_hidden_states(self.model, ids, None)[positions.to(device, non_blocking=True)]
+            inv_t = getattr(self, "inv_temperature", 1.0)
+            if inv_t != 1.0:
+                hidden = hidden * inv_t
             lp, entropy = target_logprobs(hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight)
             loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config)
             if self.ref_lp:
@@ -475,7 +488,7 @@ class RLTrainer:
             def loss_fn(i: int, hidden: torch.Tensor, trained=trained) -> torch.Tensor:
                 t = trained[i]
                 sampled = [j for j, m in enumerate(t.mask) if m]
-                rows = hidden[0, sampled]
+                rows = hidden[0, sampled] * getattr(self, "inv_temperature", 1.0)
                 targets = torch.tensor([t.tokens[j] for j in sampled], device=device)
                 floats = torch.tensor(
                     [[t.logprobs[j] for j in sampled], [t.advantage] * len(sampled), [weights[id(t)]] * len(sampled)],
@@ -739,6 +752,11 @@ class RLTrainer:
         self.stale_groups = state["stale_groups"]
         logger.info("Resumed from %s at step %d", path, self.start_step)
         return state["wandb_id"]
+
+
+def _plain_linear(head) -> bool:
+    """A bias-free nn.Linear head whose logits the model uses as they are (scaling its input scales its logits)."""
+    return isinstance(head, torch.nn.Linear) and head.bias is None
 
 
 def _accumulate(totals: dict[str, torch.Tensor], stats: dict, loss: torch.Tensor, entropy: torch.Tensor) -> None:
