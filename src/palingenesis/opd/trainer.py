@@ -38,7 +38,7 @@ from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig, ro
 from palingenesis.opd.formatting import encode_prompt
 from palingenesis.opd.fused_rkl import fused_full_rkl
 from palingenesis.opd.orchestrator import Batch, Orchestrator, Pipeline, PublishedWeights, Request, Sample, TeacherRoute
-from palingenesis.opd.rollout import HFRollout, VLLMColocateRollout, VLLMServer, VLLMServerRollout
+from palingenesis.opd.rollout import HFRollout, Sampling, VLLMColocateRollout, VLLMServer, VLLMServerRollout
 from palingenesis.opd.sources import PromptSource, build_source
 from palingenesis.opd.teachers import (
     HFTeacher,
@@ -138,6 +138,17 @@ class OPDTrainer:
                 aligners[name] = SharedVocabAligner(bridge, self.stop_ids)
             self.kinds[name] = kind
             logger.info("teacher %s: %s (%s backend), loss %s", name, teacher.model, teacher.backend, kind)
+        self.sampling_mix = {name: _sampling_mix(src, config.rollout.temperature)
+                             for name, src in config.sources.items() if src.sampling_mix}
+        for name, mix in self.sampling_mix.items():
+            routed = {config.teacher_of(name)} | set(config.sources[name].topic_teachers)
+            off_policy = any(sp != Sampling(1.0) for _, sp in mix)
+            bad = sorted(t for t in routed if self.kinds.get(t) in ("sampled_rkl", "xtok"))
+            if off_policy and bad:
+                raise OPDConfigError(
+                    f"sources.{name}.sampling_mix samples away from the student's own distribution, but teacher(s) "
+                    f"{bad} use {self.kinds[bad[0]]}, whose importance ratios need the student's own samples."
+                )
 
         # vLLM servers start before the trainer's models: they claim their share of free GPU memory.
         self.servers: list[VLLMServer] = []
@@ -337,6 +348,9 @@ class OPDTrainer:
             source = meta.get("_src")
             teacher = self.config.teacher_of(source) if source in self.config.sources else next(iter(self.routes))
             request = self.pipeline.request(messages, max_new_tokens, meta, source, teacher)
+            if source in self.sampling_mix:
+                mix = self.sampling_mix[source]
+                request.sampling = self.rng.choices([sp for _, sp in mix], weights=[w for w, _ in mix])[0]
             longest = max(len(request.prompt_ids), len(request.teacher_prompt_ids))
             if longest + MIN_COMPLETION > limit:
                 self.skipped_long += 1
@@ -650,14 +664,19 @@ class OPDTrainer:
             self.student.train()
 
     def greedy_generate(self, messages_list, max_new_tokens: int, metas=None) -> list[str]:
+        return [text for text, _, _ in self.sample_generate(messages_list, max_new_tokens, metas, Sampling(0.0))]
+
+    def sample_generate(self, messages_list, max_new_tokens: int, metas, sampling: Sampling):
+        """(decoded text, finish reason, completion tokens) per conversation, sampled with `sampling`."""
         metas = metas or [{}] * len(messages_list)
         prompts = [
             encode_prompt(self.tok, m, {**self.config.model.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
                           meta.get("tools"))
             for m, meta in zip(messages_list, metas)
         ]
-        rollouts, _ = self.pipeline.generate(prompts, [max_new_tokens] * len(prompts), 0.0)
-        return [self.tok.decode(r.completion_ids, skip_special_tokens=True) for r in rollouts]
+        rollouts, _ = self.pipeline.generate(prompts, [max_new_tokens] * len(prompts), sampling)
+        return [(self.tok.decode(r.completion_ids, skip_special_tokens=True), r.finish_reason, len(r.completion_ids))
+                for r in rollouts]
 
     @torch.no_grad()
     def dev_kl(
@@ -778,6 +797,13 @@ def resolve_resume(resume_from: str, output_dir: str) -> str | None:
     return resume_from
 
 
+def _sampling_mix(source, temperature: float) -> list[tuple[float, Sampling]]:
+    """sources.<name>.sampling_mix as (weight, Sampling) pairs."""
+    return [(float(e.get("weight", 1.0)),
+             Sampling(float(e.get("temperature", temperature)), float(e.get("top_p", 1.0)), int(e.get("top_k", 0))))
+            for e in source.sampling_mix]
+
+
 class _SourceEngine:
     """The engine services a source's evaluate() uses, bound to that source's teacher."""
 
@@ -792,6 +818,14 @@ class _SourceEngine:
 
     def dev_kl(self, messages_list, max_new_tokens: int, metas=None) -> dict[str, float]:
         return self.trainer.dev_kl(messages_list, max_new_tokens, self.source, self.teacher, metas)
+
+    def deploy_generate(self, messages_list, max_new_tokens: int, metas=None):
+        """Dev answers at train.eval_sampling (the deployment sampling), or None when it is not set."""
+        sampling = self.trainer.config.train.eval_sampling
+        if not sampling:
+            return None
+        sp = Sampling(float(sampling.get("temperature", 1.0)), float(sampling.get("top_p", 1.0)), int(sampling.get("top_k", 0)))
+        return self.trainer.sample_generate(messages_list, max_new_tokens, metas, sp)
 
 
 def main():

@@ -889,3 +889,60 @@ def test_privileged_options_are_validated():
     assert "privileged_template" in errors(privileged_field="solution", privileged_template="{content} only")
     assert "privileged_template" in errors(privileged_field="solution", privileged_template="{content}{privileged}{x}")
     assert "format 'messages' only" in errors(privileged_field="solution", format="mcqa")
+
+
+def test_samplings_truncation_and_loop_detector():
+    import torch
+
+    from palingenesis.opd.formatting import looped
+    from palingenesis.opd.rollout import Sampling, samplings, truncate_scores
+
+    assert samplings(0.7, 2) == [Sampling(0.7), Sampling(0.7)]
+    assert samplings(Sampling(0.7, 0.8, 20), 1) == [Sampling(0.7, 0.8, 20)]
+    assert samplings([Sampling(1.0), 0.0], 2) == [Sampling(1.0), Sampling(0.0)]
+    with pytest.raises(ValueError):
+        samplings([Sampling()], 2)
+    assert Sampling(0.7, top_k=20).truncated and not Sampling(0.7).truncated
+
+    scores = torch.log(torch.tensor([[0.5, 0.3, 0.15, 0.05]]))
+    kept = lambda s: torch.isfinite(s)[0].tolist()  # noqa: E731
+    assert kept(truncate_scores(scores, 2, 1.0)) == [True, True, False, False]
+    assert kept(truncate_scores(scores, 0, 0.8)) == [True, True, False, False]  # .5 + .3 reaches .8
+    assert kept(truncate_scores(scores, 0, 0.81)) == [True, True, True, False]  # the token crossing top_p stays
+    assert kept(truncate_scores(scores, 0, 1.0)) == [True] * 4
+
+    assert looped("abc", "length")
+    assert looped("Ciao! " + "Questa frase si ripete senza fine, ancora e ancora. " * 12, "stop")
+    assert not looped("Una risposta normale, con frasi diverse. Poi un'altra idea. Fine.", "stop")
+    assert not looped("<think>" + "loop " * 400 + "</think>Risposta breve.", "stop")  # thinking is not judged
+
+
+def test_sampling_mix_options_are_validated():
+    from palingenesis.opd.config import OPDConfig, OPDConfigError
+
+    def errors(teacher_loss="", eval_sampling=None, **source):
+        config = OPDConfig()
+        config.set("model.student", "s", "test")
+        config.set("teachers.t.model", "t", "test")
+        if teacher_loss:
+            config.set("teachers.t.loss", teacher_loss, "test")
+        config.set("sources.a.path", "a.jsonl", "test")
+        if eval_sampling is not None:
+            config.set("train.eval_sampling", eval_sampling, "test")
+        for key, value in source.items():
+            config.set(f"sources.a.{key}", value, "test")
+        try:
+            config.validate()
+        except OPDConfigError as exc:
+            return str(exc)
+        return ""
+
+    deploy = {"temperature": 0.7, "top_p": 0.8, "top_k": 20}
+    assert errors(sampling_mix=[deploy, {"weight": 1}]) == ""
+    assert "sampled_rkl" in errors("sampled_rkl", sampling_mix=[deploy])
+    assert errors("sampled_rkl", sampling_mix=[{"temperature": 1.0}]) == ""  # the student's own sampling
+    assert "sampling_mix entries" in errors(sampling_mix=[{"temp": 0.7}])
+    assert "top_p" in errors(sampling_mix=[{"top_p": 1.5}])
+    assert "positive total weight" in errors(sampling_mix=[{"weight": 0}])
+    assert "train.eval_sampling" in errors(eval_sampling={"temperature": 0})
+    assert errors(eval_sampling=deploy) == ""

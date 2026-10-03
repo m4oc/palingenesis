@@ -55,6 +55,15 @@ def encode_prompt(
     return ids
 
 
+def looped(text: str, finish: str) -> bool:
+    """A degenerate answer: it hit the token budget, or its last 1,500 characters repeat a 60-character span at
+    least 4 times (the repetition-loop detector of the research evaluation suite). Thinking is not judged."""
+    if finish == "length":
+        return True
+    tail = text.split("</think>")[-1][-1500:]
+    return any(tail.count(tail[i : i + 60]) >= 4 for i in range(0, max(0, len(tail) - 60), 30))
+
+
 def with_privileged(messages: list[dict], privileged: str, template: str) -> list[dict]:
     """The teacher's copy of `messages`: the last user turn rewritten by `template` ({content}, {privileged}).
     The last user turn, not the last message: in a mid-episode state the conversation ends with a tool

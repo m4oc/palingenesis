@@ -91,6 +91,15 @@ class SourceConfig:
     # is the student's own checkpoint. Empty = off; rows without the field are ordinary rows.
     privileged_field: str = ""
     privileged_template: str = "{content}\n\n{privileged}"
+    # ---- rollout sampling of this source's prompts ----
+    # A mixture drawn per rollout: [{weight, temperature, top_p, top_k}, ...] (missing keys: weight 1,
+    # temperature rollout.temperature, top_p 1, top_k 0). E.g. half the non-thinking rollouts at the
+    # deployment sampling ({temperature: 0.7, top_p: 0.8, top_k: 20}) so the student is trained on the states
+    # it reaches when deployed, where repetition loops start, not only on its T=1 states. full_rkl, topk_kl
+    # and rs_kd score the student's own (unscaled) distribution on whatever states were visited, so they stay
+    # exact; sampled_rkl and xtok need the sampling to be the student's own (their behaviour log-probs).
+    # Empty = rollout.temperature, untruncated.
+    sampling_mix: list = field(default_factory=list)
     # ---- agent_traces ----
     messages_field: str = "messages"
     tools_field: str = "tools"
@@ -206,6 +215,11 @@ class OPDTrainConfig:
     score_micro_seqs: int = 16  # sequences per scoring forward (student and teacher)
     eval_every: int = 50  # dev metrics every N steps, and before the first (0 = off)
     eval_samples: int = 200  # dev prompts per source
+    # Also sample each messages source's dev prompts at this sampling ({temperature, top_p, top_k}, e.g. a model's
+    # recommended deployment settings) and report dev_loop (share of answers that end in a repetition loop or hit
+    # the token budget) and dev_len_deploy. Loops after on-policy distillation can appear only at the deployment
+    # sampling, not at the rollout temperature. Empty = off.
+    eval_sampling: dict = field(default_factory=dict)
     save_steps: int = 0  # checkpoint every N steps (0 = final only)
     keep_checkpoints: int = 3  # newest step_* dirs kept on disk (0 = keep all)
     tree_chunk_size: int = 8192  # agent_traces: tokens per chunk of the trunk (activation memory)
@@ -400,6 +414,31 @@ class OPDConfig:
                         f"{where}.privileged_template must contain {{content}} and {{privileged}} and no other "
                         f"placeholder, got {source.privileged_template!r}."
                     )
+            for entry in source.sampling_mix:
+                if not isinstance(entry, dict) or set(entry) - {"weight", "temperature", "top_p", "top_k"}:
+                    errors.append(f"{where}.sampling_mix entries are {{weight, temperature, top_p, top_k}}, got {entry!r}.")
+                    continue
+                if entry.get("weight", 1.0) < 0 or entry.get("temperature", 1.0) <= 0:
+                    errors.append(f"{where}.sampling_mix: weight must be >= 0 and temperature > 0, got {entry!r}.")
+                if not 0 < entry.get("top_p", 1.0) <= 1 or entry.get("top_k", 0) < 0:
+                    errors.append(f"{where}.sampling_mix: top_p must be in (0, 1] and top_k >= 0, got {entry!r}.")
+            if source.sampling_mix:
+                if source.format != "messages":
+                    errors.append(f"{where}.sampling_mix applies to format 'messages' only.")
+                if sum(e.get("weight", 1.0) for e in source.sampling_mix if isinstance(e, dict)) <= 0:
+                    errors.append(f"{where}.sampling_mix needs a positive total weight.")
+                not_student = [e for e in source.sampling_mix if isinstance(e, dict)
+                               and (e.get("temperature", self.rollout.temperature) != 1.0
+                                    or e.get("top_p", 1.0) < 1.0 or e.get("top_k", 0) > 0)]
+                teachers = {source.teacher or next(iter(self.teachers), "")} | set(source.topic_teachers)
+                for name in teachers:
+                    teacher = self.teachers.get(name)
+                    if not_student and teacher is not None and teacher.loss in ("sampled_rkl", "xtok"):
+                        errors.append(
+                            f"{where}.sampling_mix samples away from the student's own distribution, but teacher "
+                            f"{name!r} uses {teacher.loss}, whose importance ratios need the student's samples. Use "
+                            "full_rkl, topk_kl or rs_kd for this source, or temperature 1 without truncation."
+                        )
             if source.format == "agent_traces":
                 if source.max_context < 16:
                     errors.append(f"{where}.max_context must be >= 16, got {source.max_context}.")
@@ -467,9 +506,14 @@ class OPDConfig:
             errors.append("rollout.url applies to the vllm_server backend only.")
         if rollout.temperature != 1.0:
             warnings.append(
-                f"rollout.temperature={rollout.temperature}: the losses compare the teacher with the "
-                "student's temperature-scaled distribution, not the student itself."
+                f"rollout.temperature={rollout.temperature}: rollouts visit the states of a temperature-scaled "
+                "student. full_rkl / topk_kl / rs_kd still score the student's own distribution there; sampled_rkl "
+                "and xtok weight by importance ratios against the scaled sampler (ratios far from 1 get clipped)."
             )
+        sampling = self.train.eval_sampling
+        if sampling and (set(sampling) - {"temperature", "top_p", "top_k"} or sampling.get("temperature", 1.0) <= 0
+                         or not 0 < sampling.get("top_p", 1.0) <= 1 or sampling.get("top_k", 0) < 0):
+            errors.append(f"train.eval_sampling must be {{temperature > 0, top_p in (0, 1], top_k >= 0}}, got {sampling!r}.")
         if not 0.0 <= loss.beta <= 1.0:
             errors.append(f"loss.beta must be in [0, 1], got {loss.beta}.")
         if loss.xtok_spread not in ("chunk", "proportional"):

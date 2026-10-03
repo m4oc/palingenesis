@@ -38,7 +38,7 @@ from torch import nn
 
 from palingenesis.opd.align import TeacherView
 from palingenesis.opd.formatting import encode_prompt
-from palingenesis.opd.rollout import RolloutEngine, checkpoint_named_parameters
+from palingenesis.opd.rollout import RolloutEngine, Sampling, checkpoint_named_parameters
 from palingenesis.opd.teachers import TeacherScores
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,7 @@ class Request:
     teacher: str
     prompt_ids: list[int]
     teacher_prompt_ids: list[int]
+    sampling: Sampling | None = None  # None = rollout.temperature, untruncated
 
 
 @dataclass
@@ -185,7 +186,7 @@ class Pipeline:
                           {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})}, meta.get("tools")),
         )
 
-    def generate(self, prompts: list[list[int]], max_new_tokens: list[int], temperature: float):
+    def generate(self, prompts: list[list[int]], max_new_tokens: list[int], temperature):
         """Rollouts with the newest weights; returns (rollouts, stats)."""
         with self._exclusive():
             sync = self.weights.sync(self.engine)
@@ -209,7 +210,9 @@ class Pipeline:
         """Scored samples for `requests` (empty completions are dropped)."""
         with self._exclusive():
             rollouts, stats = self.generate(
-                [r.prompt_ids for r in requests], [r.max_new_tokens for r in requests], temperature
+                [r.prompt_ids for r in requests],
+                [r.max_new_tokens for r in requests],
+                [r.sampling or Sampling(temperature) for r in requests],
             )
             start = time.perf_counter()
             samples = []

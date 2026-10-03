@@ -341,3 +341,46 @@ def test_privileged_self_distillation_run(tmp_path, models):
     assert all(len(r.teacher_prompt_ids) > len(r.prompt_ids) for r in requests)
     # a tiny random model barely reads the extra context: ~2.6e-4 against ~3e-7 without it
     assert privileged["dev_kl_full/math"] > 100 * max(abs(plain["dev_kl_full/math"]), 1e-7)
+
+
+def test_hf_rollout_per_prompt_sampling_records_the_truncated_distribution(models):
+    """One Sampling per prompt: top_k 1 is greedy (log-prob 0); top_k / top_p rollouts record the log-probs of the
+    truncated, renormalized, temperature-scaled distribution each token was drawn from."""
+    from palingenesis.opd.rollout import HFRollout, Sampling, truncate_scores
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(models["student"]).eval()
+    engine = HFRollout(model, stop_ids=(151645,), pad_id=151643, micro_seqs=4)
+    prompts = [[9707, 11, 1879], [3838, 374, 220, 17, 10, 17, 30], [9707, 11, 1879]]
+    plan = [Sampling(0.7, top_k=1), Sampling(0.7, top_p=0.8, top_k=20), Sampling(1.0)]
+    rollouts = engine.generate(prompts, [6, 6, 6], plan)
+    greedy = engine.generate(prompts[:1], [6], 0.0)[0]
+    assert rollouts[0].completion_ids == greedy.completion_ids and max(abs(x) for x in rollouts[0].logprobs) < 1e-5
+    for prompt, rollout, sampling in zip(prompts[1:], rollouts[1:], plan[1:]):
+        ids = torch.tensor([prompt + rollout.completion_ids])
+        with torch.no_grad():
+            logits = model(ids).logits[0, len(prompt) - 1 : -1].float() / sampling.temperature
+        want = torch.log_softmax(truncate_scores(logits, sampling.top_k, sampling.top_p), -1)
+        want = want.gather(1, torch.tensor(rollout.completion_ids)[:, None]).squeeze(1)
+        torch.testing.assert_close(torch.tensor(rollout.logprobs), want, atol=1e-4, rtol=1e-4)
+
+
+def test_sampling_mix_and_deployment_dev_metrics_run(tmp_path, models):
+    """sources.<name>.sampling_mix draws each rollout's sampling from the mixture; train.eval_sampling adds the dev
+    loop rate and length at the deployment sampling."""
+    from palingenesis.opd.rollout import Sampling
+    from palingenesis.opd.trainer import OPDTrainer
+
+    config = make_config(tmp_path, models)
+    config.set("sources.math.sampling_mix", [{"weight": 1, "temperature": 0.7, "top_p": 0.8, "top_k": 20}, {"weight": 1}], "test")
+    config.set("train.eval_sampling", {"temperature": 0.7, "top_p": 0.8, "top_k": 20}, "test")
+    config.set("train.steps", 1, "test")
+    trainer = OPDTrainer(config)
+    drawn = {r.sampling for _ in range(8) for r in trainer._draw() if r.source == "math"}
+    assert drawn == {Sampling(0.7, 0.8, 20), Sampling(1.0)}
+    assert all(r.sampling is None for r in trainer._draw() if r.source == "chat")
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append((kind, metrics))
+    trainer.train()
+    evals = [m for kind, m in logged if kind == "eval"]
+    assert {"dev_loop/math", "dev_len_deploy/math", "dev_loop/chat"} <= set(evals[0])
+    assert 0.0 <= evals[0]["dev_loop/math"] <= 1.0 and evals[0]["dev_len_deploy/math"] > 0

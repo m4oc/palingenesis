@@ -38,6 +38,7 @@ from palingenesis.opd.formatting import (
     extract_letter,
     extract_number,
     load_reference_shots,
+    looped,
     with_privileged,
 )
 from palingenesis.opd.pool import load_pool, question_hash, split_pool
@@ -226,6 +227,11 @@ class ChatMessagesSource:
     def evaluate(self, engine: Engine) -> dict[str, float]:
         rows = self.dev_rows[: self.eval_samples]
         metrics = engine.dev_kl([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows])
+        deploy = getattr(engine, "deploy_generate", None)
+        answers = deploy([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows]) if deploy else None
+        if answers:
+            metrics["dev_loop"] = sum(looped(text, finish) for text, finish, _ in answers) / len(answers)
+            metrics["dev_len_deploy"] = sum(n for _, _, n in answers) / len(answers)
         graded = [r for r in rows if "answer" in r]
         if graded:
             texts = engine.greedy_generate(

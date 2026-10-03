@@ -10,9 +10,12 @@
                        concurrently with training (rollout.max_staleness > 0).
 
 Every engine returns, per completion, the log-probability of each sampled token
-under the policy that sampled it (after temperature: vLLM's
+under the policy that sampled it (after temperature and top-k / top-p: vLLM's
 "processed_logprobs"), which the policy-gradient losses use as the behaviour
 policy mu of their importance ratios.
+
+`generate(prompts, max_new_tokens, temperature)` takes the sampling as a float
+(temperature, no truncation; 0 = greedy), a Sampling, or one Sampling per prompt.
 
 vLLM is imported lazily: without it installed, the hf backend works as before.
 """
@@ -42,6 +45,44 @@ from torch import Tensor, nn
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class Sampling:
+    """How a rollout is sampled: temperature (0 = greedy), nucleus top_p (1 = off), top_k (0 = off)."""
+
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 0
+
+    @property
+    def truncated(self) -> bool:
+        return self.top_p < 1.0 or self.top_k > 0
+
+
+def samplings(spec, n: int) -> list[Sampling]:
+    """One Sampling per prompt from a float temperature, a Sampling, or a list of them."""
+    if isinstance(spec, (int, float)):
+        return [Sampling(float(spec))] * n
+    if isinstance(spec, Sampling):
+        return [spec] * n
+    spec = list(spec)
+    if len(spec) != n:
+        raise ValueError(f"{len(spec)} samplings for {n} prompts")
+    return [x if isinstance(x, Sampling) else Sampling(float(x)) for x in spec]
+
+
+def truncate_scores(scores: Tensor, top_k: int, top_p: float) -> Tensor:
+    """Scores outside the top_k tokens or the top_p nucleus set to -inf (the token that crosses top_p stays)."""
+    if top_k > 0 and top_k < scores.shape[-1]:
+        kth = torch.topk(scores, top_k, dim=-1).values[..., -1:]
+        scores = scores.masked_fill(scores < kth, float("-inf"))
+    if top_p < 1.0:
+        sorted_scores, order = torch.sort(scores, dim=-1, descending=True)
+        probs = torch.softmax(sorted_scores.float(), -1)
+        drop = probs.cumsum(-1) - probs > top_p  # mass before this token already exceeds top_p
+        scores = scores.masked_fill(drop.scatter(-1, order, drop), float("-inf"))
+    return scores
+
+
 @dataclass
 class Rollout:
     completion_ids: list[int]
@@ -53,8 +94,8 @@ class Rollout:
 class RolloutEngine(Protocol):
     version: int  # optimizer steps reflected in the engine's weights (-1: none loaded)
 
-    def generate(self, prompts: list[list[int]], max_new_tokens: list[int], temperature: float) -> list[Rollout]:
-        """One completion per prompt; temperature 0 = greedy."""
+    def generate(self, prompts: list[list[int]], max_new_tokens: list[int], temperature) -> list[Rollout]:
+        """One completion per prompt; `temperature`: a float (0 = greedy), a Sampling or one per prompt."""
 
     def update_weights(self, named_tensors: Iterable[tuple[str, Tensor]], version: int) -> None:
         """Load the student's current weights (checkpoint-format names)."""
@@ -92,19 +133,19 @@ def checkpoint_named_parameters(
 
 
 class _RecordLogprobs:
-    """Logits processor: temperature-scales the scores and records each sampled
-    token's log-probability. The token sampled at step t is visible at step t+1
-    as input_ids[:, -1], so each call records the previous step's choice."""
+    """Logits processor: temperature-scales (and top-k / top-p truncates) the scores
+    and records each sampled token's log-probability. The token sampled at step t is
+    visible at step t+1 as input_ids[:, -1], so each call records the previous step's choice."""
 
-    def __init__(self, temperature: float):
-        self.temperature = temperature
+    def __init__(self, sampling: Sampling):
+        self.sampling = sampling
         self.previous: Tensor | None = None
         self.logprobs: list[Tensor] = []
 
     def __call__(self, input_ids: Tensor, scores: Tensor) -> Tensor:
         if self.previous is not None:
             self.logprobs.append(self.previous.gather(1, input_ids[:, -1:]).squeeze(1))
-        scores = scores / self.temperature
+        scores = truncate_scores(scores / self.sampling.temperature, self.sampling.top_k, self.sampling.top_p)
         self.previous = torch.log_softmax(scores.float(), -1)
         return scores
 
@@ -140,11 +181,13 @@ class HFRollout:
 
         device = next(self.model.parameters()).device
         out: list[Rollout | None] = [None] * len(prompts)
+        per_prompt = samplings(temperature, len(prompts))
         was_training = self.model.training
         self.model.eval()
         try:
-            for budget in sorted(set(max_new_tokens)):
-                idx = [i for i, m in enumerate(max_new_tokens) if m == budget]
+            for budget, sampling in sorted(set(zip(max_new_tokens, per_prompt)), key=lambda x: (x[0], repr(x[1]))):
+                idx = [i for i, (m, sp) in enumerate(zip(max_new_tokens, per_prompt)) if m == budget and sp == sampling]
+                temperature = sampling.temperature
                 for start in range(0, len(idx), self.micro_seqs):
                     chunk = idx[start : start + self.micro_seqs]
                     width = max(len(prompts[i]) for i in chunk)
@@ -153,16 +196,16 @@ class HFRollout:
                     for row, i in enumerate(chunk):
                         ids[row, width - len(prompts[i]) :] = torch.tensor(prompts[i])
                         mask[row, width - len(prompts[i]) :] = 1
-                    # Temperature is applied by the recorder, so the recorded log-probs are the sampled ones.
-                    sampling = dict(do_sample=True, temperature=1.0, top_k=0, top_p=1.0) if temperature > 0 else {}
+                    # Temperature and truncation are applied by the recorder, so the recorded log-probs are the sampled ones.
+                    sample_kwargs = dict(do_sample=True, temperature=1.0, top_k=0, top_p=1.0) if temperature > 0 else {}
                     config = GenerationConfig(
                         max_new_tokens=budget,
                         eos_token_id=list(self.stop_ids),
                         pad_token_id=self.pad_id,
                         use_cache=True,  # the model config may disable it for training
-                        **sampling,
+                        **sample_kwargs,
                     )
-                    recorder = _RecordLogprobs(temperature) if temperature > 0 else None
+                    recorder = _RecordLogprobs(sampling) if temperature > 0 else None
                     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                         seqs = self.model.generate(
                             ids.to(device),
@@ -301,12 +344,12 @@ class VLLMColocateRollout:
         request with n samples: the prompt is prefilled once and its KV cache forked, instead
         of relying on the prefix cache to find it n times."""
         unique: dict[tuple, list[int]] = {}
-        for i, (prompt, budget) in enumerate(zip(prompts, max_new_tokens)):
-            unique.setdefault((tuple(prompt), budget), []).append(i)
+        for i, (prompt, budget, sampling) in enumerate(zip(prompts, max_new_tokens, samplings(temperature, len(prompts)))):
+            unique.setdefault((tuple(prompt), budget, sampling), []).append(i)
         requests = list(unique.items())
-        params = [self._params(len(indices), budget, temperature) for (_, budget), indices in requests]
+        params = [self._params(len(indices), budget, sampling) for (_, budget, sampling), indices in requests]
         outputs = self.llm.generate(
-            [{"prompt_token_ids": list(prompt)} for (prompt, _), _ in requests], params, use_tqdm=False
+            [{"prompt_token_ids": list(prompt)} for (prompt, _, _), _ in requests], params, use_tqdm=False
         )
         rollouts: list[Rollout | None] = [None] * len(prompts)
         for (_, indices), out in zip(requests, outputs):
@@ -314,7 +357,8 @@ class VLLMColocateRollout:
                 rollouts[i] = rollout
         return rollouts
 
-    def _params(self, n: int, budget: int, temperature: float, final_only: bool = False):
+    def _params(self, n: int, budget: int, sampling, final_only: bool = False):
+        (sampling,) = samplings(sampling, 1)
         kwargs = {}
         if final_only:
             from vllm.sampling_params import RequestOutputKind
@@ -323,10 +367,10 @@ class VLLMColocateRollout:
         return self.SamplingParams(
             n=n,
             max_tokens=budget,
-            temperature=temperature,
-            top_p=1.0,
-            top_k=0,
-            logprobs=0 if temperature > 0 else None,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            top_k=sampling.top_k,
+            logprobs=0 if sampling.temperature > 0 else None,
             stop_token_ids=list(self.stop_ids),
             detokenize=False,
             **kwargs,
@@ -344,7 +388,7 @@ class VLLMColocateRollout:
     # Streaming (continuous batching across calls): requests join the running batch the moment
     # they are added and come back the step they finish. One thread must own these calls.
 
-    def stream_add(self, request_id: str, prompt: list[int], max_new_tokens: int, temperature: float, n: int) -> None:
+    def stream_add(self, request_id: str, prompt: list[int], max_new_tokens: int, temperature, n: int) -> None:
         params = self._params(n, max_new_tokens, temperature, final_only=True)
         self.llm.llm_engine.add_request(request_id, {"prompt_token_ids": list(prompt)}, params)
 
@@ -531,15 +575,16 @@ class VLLMServerRollout:
 
     def generate(self, prompts, max_new_tokens, temperature):
         out: list[Rollout | None] = [None] * len(prompts)
-        for budget in sorted(set(max_new_tokens)):
-            idx = [i for i, m in enumerate(max_new_tokens) if m == budget]
+        per_prompt = samplings(temperature, len(prompts))
+        for budget, sampling in sorted(set(zip(max_new_tokens, per_prompt)), key=lambda x: (x[0], repr(x[1]))):
+            idx = [i for i, (m, sp) in enumerate(zip(max_new_tokens, per_prompt)) if m == budget and sp == sampling]
             choices = self.server.complete(
                 [prompts[i] for i in idx],
                 max_tokens=budget,
-                temperature=temperature,
-                top_p=1.0,
-                top_k=0,
-                logprobs=0 if temperature > 0 else None,
+                temperature=sampling.temperature,
+                top_p=sampling.top_p,
+                top_k=sampling.top_k,
+                logprobs=0 if sampling.temperature > 0 else None,
                 stop_token_ids=list(self.stop_ids),
                 return_token_ids=True,
                 skip_special_tokens=False,
