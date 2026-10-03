@@ -61,7 +61,10 @@ def _qwen35():
         max_position_embeddings=512,
         attention_dropout=0.0,
     )
-    model = Qwen3_5ForCausalLM(cfg).double().train()
+    from seco_archs import torch_kernels
+
+    with torch_kernels("qwen3_5"):
+        model = Qwen3_5ForCausalLM(cfg).double().train()
     # Random init leaves A_log/dt_bias at values that make the recurrence nearly
     # trivial; spread them so the state really carries information across chunks.
     with torch.no_grad():

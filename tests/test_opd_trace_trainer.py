@@ -114,7 +114,8 @@ def test_training_run(tmp_path, models, branch, kd):
     assert (tmp_path / "run" / "final" / "config.json").exists()
 
 
-def test_trace_loss_equals_every_turn_as_its_own_sequence(tmp_path, models):
+def test_trace_loss_equals_every_turn_as_its_own_sequence(tmp_path, models, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)  # an fp32 CPU reference (GPU path: test_opd_gpu.py)
     from palingenesis.logits import output_head
     from palingenesis.opd.fused_rkl import fused_full_rkl
     from palingenesis.opd.trace_trainer import TraceTrainer

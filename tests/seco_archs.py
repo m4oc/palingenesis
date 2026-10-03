@@ -4,7 +4,37 @@ Each entry is (model_type, config overrides). Sizes are minimal; sliding windows
 (24) are smaller than the test sequence so windows cross chunk boundaries.
 """
 
+import contextlib
+import importlib
+
 import torch
+
+# Gated-DeltaNet fast paths. Where causal-conv1d / fla are installed (the GPU box), HF builds the linear-attention
+# layers on their CUDA/Triton kernels whatever the tensors' device and dtype, and those reject fp64 CPU tensors.
+_KERNELS = ("causal_conv1d_fn", "causal_conv1d_update", "chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule",
+            "FusedRMSNormGated")
+
+
+@contextlib.contextmanager
+def torch_kernels(model_type: str):
+    """Build HF models of this type on their torch implementations (the fp64 references of the exactness tests)."""
+    import transformers
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
+    try:
+        cls = getattr(transformers, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[model_type])
+    except (KeyError, AttributeError, ImportError):  # architecture absent from this transformers version
+        yield
+        return
+    module = importlib.import_module(cls.__module__)
+    saved = {k: getattr(module, k) for k in _KERNELS if hasattr(module, k)}
+    try:
+        for k in saved:
+            setattr(module, k, None)
+        yield
+    finally:
+        for k, v in saved.items():
+            setattr(module, k, v)
 
 VOCAB = 97
 COMMON = dict(
@@ -171,7 +201,8 @@ def build(name: str, dtype=torch.float64, attn: str = "eager"):
         dtype = torch.float32
     cfg = AutoConfig.for_model(model_type, **{**COMMON, **extra})
     torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_config(cfg, attn_implementation=attn)
+    with torch_kernels(model_type):
+        model = AutoModelForCausalLM.from_config(cfg, attn_implementation=attn)
     with torch.no_grad():
         # Random init leaves recurrence gates near-trivial; spread them so state
         # really carries information across chunks.
