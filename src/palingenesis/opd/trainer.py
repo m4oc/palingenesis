@@ -342,7 +342,7 @@ class OPDTrainer:
         A prompt that leaves fewer than MIN_COMPLETION tokens of rollout.max_model_len is skipped and
         another drawn (one over-long chat in a dataset must not end the run); one that fits but not with
         its whole budget gets the room that is left."""
-        requests, limit = [], self.config.rollout.max_model_len
+        requests = []
         while len(requests) < self.config.rollout.batch_prompts * self.config.rollout.group_size:
             messages, max_new_tokens, meta = self.source.sample()
             source = meta.get("_src")
@@ -351,21 +351,27 @@ class OPDTrainer:
             if source in self.sampling_mix:
                 mix = self.sampling_mix[source]
                 request.sampling = self.rng.choices([sp for _, sp in mix], weights=[w for w, _ in mix])[0]
-            longest = max(len(request.prompt_ids), len(request.teacher_prompt_ids))
-            if longest + MIN_COMPLETION > limit:
-                self.skipped_long += 1
-                if self.skipped_long in (1, 10, 100) or self.skipped_long % 1000 == 0:
-                    logger.warning(
-                        "Skipped %d prompt(s) longer than rollout.max_model_len=%d allows (last: %d tokens, source %s)",
-                        self.skipped_long,
-                        limit,
-                        longest,
-                        source,
-                    )
+            if not self._fit(request):
                 continue
-            request.max_new_tokens = min(request.max_new_tokens, limit - longest)
             requests += [request] * self.config.rollout.group_size
         return requests
+
+    def _fit(self, request: Request) -> bool:
+        """Whether `request` fits rollout.max_model_len (its prompt, and its teacher's, leave MIN_COMPLETION tokens);
+        if it does, its budget is cut to the room that is left. Training draws and dev evaluation alike: one over-long
+        chat in a dataset must not end the run."""
+        limit = self.config.rollout.max_model_len
+        longest = max(len(request.prompt_ids), len(request.teacher_prompt_ids))
+        if longest + MIN_COMPLETION > limit:
+            self.skipped_long += 1
+            if self.skipped_long in (1, 10, 100) or self.skipped_long % 1000 == 0:
+                logger.warning(
+                    "Skipped %d prompt(s) longer than rollout.max_model_len=%d allows (last: %d tokens, source %s)",
+                    self.skipped_long, limit, longest, request.source,
+                )
+            return False
+        request.max_new_tokens = min(request.max_new_tokens, limit - longest)
+        return True
 
     def _lr_at(self, step: int) -> float:
         train = self.config.train
@@ -674,9 +680,17 @@ class OPDTrainer:
                           meta.get("tools"))
             for m, meta in zip(messages_list, metas)
         ]
-        rollouts, _ = self.pipeline.generate(prompts, [max_new_tokens] * len(prompts), sampling)
-        return [(self.tok.decode(r.completion_ids, skip_special_tokens=True), r.finish_reason, len(r.completion_ids))
-                for r in rollouts]
+        limit = self.config.rollout.max_model_len
+        fits = [i for i, ids in enumerate(prompts) if len(ids) + MIN_COMPLETION <= limit]
+        if len(fits) < len(prompts):
+            logger.warning("Dev generation: %d prompt(s) longer than rollout.max_model_len=%d skipped",
+                           len(prompts) - len(fits), limit)
+        rollouts, _ = self.pipeline.generate([prompts[i] for i in fits],
+                                             [min(max_new_tokens, limit - len(prompts[i])) for i in fits], sampling)
+        out = [("", "skipped", 0)] * len(prompts)  # one entry per conversation, aligned with the caller's rows
+        for i, r in zip(fits, rollouts):
+            out[i] = (self.tok.decode(r.completion_ids, skip_special_tokens=True), r.finish_reason, len(r.completion_ids))
+        return out
 
     @torch.no_grad()
     def dev_kl(
@@ -688,6 +702,9 @@ class OPDTrainer:
         scale for every loss; dev_kl_full (full_rkl teachers) the exact per-token KL."""
         metas = metas or [{}] * len(messages_list)
         requests = [self.pipeline.request(m, max_new_tokens, meta, source, teacher) for m, meta in zip(messages_list, metas)]
+        requests = [r for r in requests if self._fit(r)]
+        if not requests:
+            return {"dev_kl": float("nan"), "dev_len": 0.0}
         with self.pipeline.lock:  # no rollout engine activity (vLLM sleep) while this scores on the GPU
             batch = self.pipeline.run(requests, self.config.rollout.temperature)
             if not batch.samples:

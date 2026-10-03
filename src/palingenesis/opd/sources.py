@@ -229,6 +229,7 @@ class ChatMessagesSource:
         metrics = engine.dev_kl([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows])
         deploy = getattr(engine, "deploy_generate", None)
         answers = deploy([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows]) if deploy else None
+        answers = [a for a in answers or [] if a[1] != "skipped"]  # prompts too long for rollout.max_model_len
         if answers:
             metrics["dev_loop"] = sum(looped(text, finish) for text, finish, _ in answers) / len(answers)
             metrics["dev_len_deploy"] = sum(n for _, _, n in answers) / len(answers)

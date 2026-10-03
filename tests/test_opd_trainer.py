@@ -307,6 +307,25 @@ def test_draw_skips_prompts_too_long_for_the_context(tmp_path, models):
         assert len(r.prompt_ids) + r.max_new_tokens <= 160 and r.max_new_tokens >= MIN_COMPLETION
 
 
+def test_dev_evaluation_skips_prompts_too_long_for_the_context(tmp_path, models):
+    """Dev rows too long for rollout.max_model_len are skipped by dev_kl and by the deployment-sampling generation
+    (a run once crashed at its first evaluation on one such row); answers stay aligned with the rows."""
+    from palingenesis.opd.rollout import Sampling
+    from palingenesis.opd.trainer import OPDTrainer
+
+    config = make_config(tmp_path, models)
+    config.set("rollout.max_model_len", 160, "test")
+    config.set("train.eval_sampling", {"temperature": 0.7, "top_p": 0.8, "top_k": 20}, "test")
+    trainer = OPDTrainer(config)
+    long = [{"role": "user", "content": "word " * 400}]
+    short = [{"role": "user", "content": "What is 1 plus 2?"}]
+    answers = trainer.sample_generate([long, short, long], 8, None, Sampling(0.7, 0.8, 20))
+    assert [a[1] for a in answers].count("skipped") == 2 and answers[1][1] != "skipped"
+    metrics = trainer.dev_kl([long, short], 8, "math", "same")
+    assert metrics["dev_len"] > 0
+    assert trainer.dev_kl([long], 8, "math", "same")["dev_len"] == 0.0
+
+
 def test_privileged_self_distillation_run(tmp_path, models):
     """OPSD: the teacher is the student's own checkpoint and sees each row's reference answer. Without the privileged
     context the teacher IS the student (KL 0 to rounding); with it the teacher's prompt is longer and the KL is not."""
