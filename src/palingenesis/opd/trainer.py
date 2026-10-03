@@ -649,28 +649,26 @@ class OPDTrainer:
         finally:
             self.student.train()
 
-    def greedy_generate(self, messages_list, max_new_tokens: int, tools_list=None) -> list[str]:
-        tools_list = tools_list or [None] * len(messages_list)
+    def greedy_generate(self, messages_list, max_new_tokens: int, metas=None) -> list[str]:
+        metas = metas or [{}] * len(messages_list)
         prompts = [
-            encode_prompt(self.tok, m, self.config.model.chat_template_kwargs, t)
-            for m, t in zip(messages_list, tools_list)
+            encode_prompt(self.tok, m, {**self.config.model.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
+                          meta.get("tools"))
+            for m, meta in zip(messages_list, metas)
         ]
         rollouts, _ = self.pipeline.generate(prompts, [max_new_tokens] * len(prompts), 0.0)
         return [self.tok.decode(r.completion_ids, skip_special_tokens=True) for r in rollouts]
 
     @torch.no_grad()
     def dev_kl(
-        self, messages_list, max_new_tokens: int, source: str | None, teacher: str, tools_list=None
+        self, messages_list, max_new_tokens: int, source: str | None, teacher: str, metas=None
     ) -> dict[str, float]:
         """Sample the held-out prompts on-policy, score them against `teacher`, no gradient.
 
         dev_kl is the sampled estimate sum(log p_S - log p_T) per student token, on one
         scale for every loss; dev_kl_full (full_rkl teachers) the exact per-token KL."""
-        tools_list = tools_list or [None] * len(messages_list)
-        requests = [
-            self.pipeline.request(m, max_new_tokens, {"tools": t} if t else {}, source, teacher)
-            for m, t in zip(messages_list, tools_list)
-        ]
+        metas = metas or [{}] * len(messages_list)
+        requests = [self.pipeline.request(m, max_new_tokens, meta, source, teacher) for m, meta in zip(messages_list, metas)]
         with self.pipeline.lock:  # no rollout engine activity (vLLM sleep) while this scores on the GPU
             batch = self.pipeline.run(requests, self.config.rollout.temperature)
             if not batch.samples:
@@ -789,11 +787,11 @@ class _SourceEngine:
         config = trainer.config
         self.teacher = config.teacher_of(source) if source in config.sources else next(iter(trainer.routes))
 
-    def greedy_generate(self, messages_list, max_new_tokens: int, tools_list=None) -> list[str]:
-        return self.trainer.greedy_generate(messages_list, max_new_tokens, tools_list)
+    def greedy_generate(self, messages_list, max_new_tokens: int, metas=None) -> list[str]:
+        return self.trainer.greedy_generate(messages_list, max_new_tokens, metas)
 
-    def dev_kl(self, messages_list, max_new_tokens: int, tools_list=None) -> dict[str, float]:
-        return self.trainer.dev_kl(messages_list, max_new_tokens, self.source, self.teacher, tools_list)
+    def dev_kl(self, messages_list, max_new_tokens: int, metas=None) -> dict[str, float]:
+        return self.trainer.dev_kl(messages_list, max_new_tokens, self.source, self.teacher, metas)
 
 
 def main():

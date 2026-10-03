@@ -55,6 +55,18 @@ def encode_prompt(
     return ids
 
 
+def with_privileged(messages: list[dict], privileged: str, template: str) -> list[dict]:
+    """The teacher's copy of `messages`: the last user turn rewritten by `template` ({content}, {privileged}).
+    The last user turn, not the last message: in a mid-episode state the conversation ends with a tool
+    result, which must stay what the tool returned."""
+    last = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=None)
+    if last is None:
+        raise ValueError("privileged context needs a user turn to attach to")
+    out = list(messages)
+    out[last] = {**messages[last], "content": template.format(content=messages[last]["content"], privileged=privileged)}
+    return out
+
+
 def extract_number(text: str) -> str | None:
     """The final answer of a worked solution: the number after the last "Answer:",
     else the last number in the text (thousands separators removed)."""

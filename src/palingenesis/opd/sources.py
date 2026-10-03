@@ -38,6 +38,7 @@ from palingenesis.opd.formatting import (
     extract_letter,
     extract_number,
     load_reference_shots,
+    with_privileged,
 )
 from palingenesis.opd.pool import load_pool, question_hash, split_pool
 
@@ -48,14 +49,16 @@ class Engine(Protocol):
     """The trainer services a source may use during evaluate()."""
 
     def greedy_generate(
-        self, messages_list: list[list[dict[str, str]]], max_new_tokens: int, tools_list: list | None = None
+        self, messages_list: list[list[dict[str, str]]], max_new_tokens: int, metas: list[dict] | None = None
     ) -> list[str]:
-        """Greedy-decode one completion per conversation, stop token removed, decoded."""
+        """Greedy-decode one completion per conversation, stop token removed, decoded. `metas`: each
+        row's rollout meta (tools, chat_template_kwargs), as sample() returns it."""
 
     def dev_kl(
-        self, messages_list: list[list[dict[str, str]]], max_new_tokens: int, tools_list: list | None = None
+        self, messages_list: list[list[dict[str, str]]], max_new_tokens: int, metas: list[dict] | None = None
     ) -> dict[str, float]:
-        """Sample on-policy and teacher-score without grad: {"dev_kl": ..., "dev_len": ...}."""
+        """Sample on-policy and teacher-score without grad: {"dev_kl": ..., "dev_len": ...}. `metas`: each
+        row's rollout meta (tools, chat_template_kwargs, teacher_messages), as sample() returns it."""
 
 
 class PromptSource(Protocol):
@@ -205,20 +208,28 @@ class ChatMessagesSource:
             raise ValueError(f"No usable rows in {path}")
         return rows
 
-    def sample(self):
-        row = self.rng.choice(self.train_rows)
+    def meta(self, row: dict) -> dict:
+        """A row's rollout meta: its tools, its template kwargs and, with privileged context, the
+        teacher's copy of the conversation."""
         meta = {"tools": row["tools"]} if row.get("tools") else {}
         if row.get("chat_template_kwargs"):
             meta["chat_template_kwargs"] = row["chat_template_kwargs"]
-        return row["messages"], self.config.max_new_tokens, meta
+        field = self.config.privileged_field
+        if field and row.get(field):
+            meta["teacher_messages"] = with_privileged(row["messages"], str(row[field]), self.config.privileged_template)
+        return meta
+
+    def sample(self):
+        row = self.rng.choice(self.train_rows)
+        return row["messages"], self.config.max_new_tokens, self.meta(row)
 
     def evaluate(self, engine: Engine) -> dict[str, float]:
         rows = self.dev_rows[: self.eval_samples]
-        metrics = engine.dev_kl([r["messages"] for r in rows], self.config.max_new_tokens, **_tools_kw(rows))
+        metrics = engine.dev_kl([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows])
         graded = [r for r in rows if "answer" in r]
         if graded:
             texts = engine.greedy_generate(
-                [r["messages"] for r in graded], self.config.max_new_tokens, **_tools_kw(graded)
+                [r["messages"] for r in graded], self.config.max_new_tokens, [self.meta(r) for r in graded]
             )
             correct = sum(_same_number(extract_number(t), str(r["answer"])) for r, t in zip(graded, texts))
             metrics["dev_acc"] = correct / len(graded)
@@ -226,12 +237,6 @@ class ChatMessagesSource:
 
     def batch_stats(self, rollouts):
         return {}
-
-
-def _tools_kw(rows: list[dict]) -> dict:
-    """tools_list for the engine when some rows carry tool schemas (engines without tools support still work)."""
-    tools = [r.get("tools") for r in rows]
-    return {"tools_list": tools} if any(tools) else {}
 
 
 def _same_number(pred: str | None, gold: str) -> bool:

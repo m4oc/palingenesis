@@ -180,7 +180,8 @@ class Pipeline:
             # meta["chat_template_kwargs"]: the row's own template kwargs (e.g. its thinking mode) over the model's
             encode_prompt(self.student_tok, messages, {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
                           meta.get("tools")),
-            encode_prompt(self.routes[teacher].tokenizer, messages,
+            # meta["teacher_messages"]: the teacher's copy of the conversation, with context the student does not see
+            encode_prompt(self.routes[teacher].tokenizer, meta.get("teacher_messages", messages),
                           {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})}, meta.get("tools")),
         )
 

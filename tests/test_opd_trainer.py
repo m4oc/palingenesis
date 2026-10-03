@@ -305,3 +305,39 @@ def test_draw_skips_prompts_too_long_for_the_context(tmp_path, models):
     assert trainer.skipped_long == config.rollout.batch_prompts
     for r in requests:
         assert len(r.prompt_ids) + r.max_new_tokens <= 160 and r.max_new_tokens >= MIN_COMPLETION
+
+
+def test_privileged_self_distillation_run(tmp_path, models):
+    """OPSD: the teacher is the student's own checkpoint and sees each row's reference answer. Without the privileged
+    context the teacher IS the student (KL 0 to rounding); with it the teacher's prompt is longer and the KL is not."""
+    from palingenesis.opd.trainer import OPDTrainer
+
+    def run(privileged: bool):
+        (tmp_path / ("p" if privileged else "n")).mkdir()
+        config = make_config(tmp_path / ("p" if privileged else "n"), models)
+        rows = [json.loads(line) for line in open(config.sources["math"].path)]
+        path = tmp_path / f"solutions_{privileged}.jsonl"
+        path.write_text("".join(json.dumps({**r, "solution": f"The answer is {r['answer']}."}) + "\n" for r in rows))
+        config.set("teachers.self.model", models["student"], "test")
+        config.teachers.pop("same"), config.teachers.pop("other"), config.sources.pop("chat")
+        config.set("sources.math.path", str(path), "test")
+        config.set("sources.math.teacher", "self", "test")
+        config.set("train.steps", 1, "test")
+        config.set("train.learning_rate", 1e-12, "test")  # measure the teachers, not training
+        if privileged:
+            config.set("sources.math.privileged_field", "solution", "test")
+            config.set("sources.math.privileged_template", "{content}\nReference (do not mention): {privileged}", "test")
+        trainer = OPDTrainer(config)
+        requests = trainer._draw()
+        logged = []
+        trainer._log = lambda kind, metrics, step: logged.append((kind, metrics))
+        trainer.train()
+        return requests, [m for kind, m in logged if kind == "eval"][0]
+
+    plain_requests, plain = run(False)
+    assert all(r.prompt_ids == r.teacher_prompt_ids for r in plain_requests)
+    assert abs(plain["dev_kl_full/math"]) < 1e-5
+    requests, privileged = run(True)
+    assert all(len(r.teacher_prompt_ids) > len(r.prompt_ids) for r in requests)
+    # a tiny random model barely reads the extra context: ~2.6e-4 against ~3e-7 without it
+    assert privileged["dev_kl_full/math"] > 100 * max(abs(plain["dev_kl_full/math"]), 1e-7)

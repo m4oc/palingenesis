@@ -83,6 +83,14 @@ class SourceConfig:
     # {teacher: [topics]}; topics not listed go to `teacher`.
     topic_field: str = ""
     topic_teachers: dict = field(default_factory=dict)
+    # ---- messages: privileged teacher context ----
+    # Row field with text only the teacher sees (a reference solution, the verifier's expected output, a
+    # task's solution script), added to the teacher's copy of the last user turn by `privileged_template`
+    # ({content}: that turn, {privileged}: the field). The student is scored by a teacher that knows the
+    # answer: on-policy self-distillation with privileged information (OPSD, 2602.04942) when the teacher
+    # is the student's own checkpoint. Empty = off; rows without the field are ordinary rows.
+    privileged_field: str = ""
+    privileged_template: str = "{content}\n\n{privileged}"
     # ---- agent_traces ----
     messages_field: str = "messages"
     tools_field: str = "tools"
@@ -379,6 +387,19 @@ class OPDConfig:
                             f"{seen[topic]!r} and {teacher!r}."
                         )
                     seen[topic] = teacher
+            if source.privileged_field:
+                if source.format != "messages":
+                    errors.append(f"{where}.privileged_field applies to format 'messages' only.")
+                try:
+                    source.privileged_template.format(content="", privileged="")
+                    complete = all(f"{{{k}}}" in source.privileged_template for k in ("content", "privileged"))
+                except (KeyError, IndexError, ValueError):
+                    complete = False
+                if not complete:
+                    errors.append(
+                        f"{where}.privileged_template must contain {{content}} and {{privileged}} and no other "
+                        f"placeholder, got {source.privileged_template!r}."
+                    )
             if source.format == "agent_traces":
                 if source.max_context < 16:
                     errors.append(f"{where}.max_context must be >= 16, got {source.max_context}.")

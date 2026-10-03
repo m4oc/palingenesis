@@ -369,11 +369,11 @@ class FakeEngine:
         self.calls = []
         self.answer = answer
 
-    def greedy_generate(self, messages_list, max_new_tokens):
+    def greedy_generate(self, messages_list, max_new_tokens, metas=None):
         self.calls.append(("greedy", len(messages_list), max_new_tokens))
         return [self.answer] * len(messages_list)
 
-    def dev_kl(self, messages_list, max_new_tokens):
+    def dev_kl(self, messages_list, max_new_tokens, metas=None):
         self.calls.append(("dev_kl", len(messages_list), max_new_tokens))
         return {"dev_kl": 0.5, "dev_len": 3.0}
 
@@ -482,8 +482,8 @@ def test_messages_source_carries_tool_schemas(tmp_path):
     assert meta == {"tools": [tool]}
 
     class ToolsEngine(FakeEngine):
-        def dev_kl(self, messages_list, max_new_tokens, tools_list=None):
-            self.calls.append(("dev_kl", tools_list))
+        def dev_kl(self, messages_list, max_new_tokens, metas=None):
+            self.calls.append(("dev_kl", [m.get("tools") for m in metas]))
             return {"dev_kl": 0.5, "dev_len": 3.0}
 
     engine = ToolsEngine()
@@ -806,3 +806,86 @@ def test_messages_source_rows_carry_template_kwargs_and_may_end_on_tool_results(
     pipe.request(state, 16, {"chat_template_kwargs": {"enable_thinking": True}}, "s", "t")
     pipe.request(state, 16, {}, "s", "t")
     assert seen == [True, True, False, False]
+
+
+def test_privileged_context_reaches_the_teacher_only(tmp_path):
+    """sources.<name>.privileged_field: the teacher's prompt carries the row's privileged text on its last user turn
+    (not on a trailing tool result); the student's prompt, and rows without the field, are unchanged; dev rows keep
+    their privileged text and their template kwargs (dev KL in the row's own thinking mode)."""
+    from palingenesis.opd.config import SourceConfig
+    from palingenesis.opd.formatting import with_privileged
+    from palingenesis.opd.orchestrator import Pipeline
+    from palingenesis.opd.sources import ChatMessagesSource
+
+    state = [{"role": "user", "content": "Luci?"},
+             {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}]},
+             {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'}]
+    teacher_view = with_privileged(state, "Expected: lights are on.", "{content}\n[ref] {privileged}")
+    assert teacher_view[0]["content"] == "Luci?\n[ref] Expected: lights are on." and teacher_view[2] == state[2]
+    assert state[0]["content"] == "Luci?"  # the student's copy is untouched
+    with pytest.raises(ValueError, match="user turn"):
+        with_privileged([{"role": "system", "content": "s"}], "p", "{content}{privileged}")
+
+    rows = [{"messages": [{"role": "user", "content": f"2+{i}?"}], "solution": f"= {2 + i}",
+             "chat_template_kwargs": {"enable_thinking": True}} for i in range(4)]
+    rows += [{"messages": [{"role": "user", "content": "plain"}]}]
+    config = SourceConfig(path=write_chat(tmp_path / "p.jsonl", rows), dev_size=2, max_new_tokens=16,
+                          privileged_field="solution")
+    source = ChatMessagesSource(config, eval_samples=2, seed=0, rng=random.Random(0))
+    metas = {json.dumps(m, sort_keys=True) for m in (source.meta(r) for r in source.train_rows + source.dev_rows)}
+    assert json.dumps({}, sort_keys=True) in metas  # the row without the field
+    meta = source.meta(rows[1])
+    assert meta["teacher_messages"] == [{"role": "user", "content": "2+1?\n\n= 3"}]
+    assert meta["chat_template_kwargs"] == {"enable_thinking": True}
+
+    class RecordingEngine(FakeEngine):
+        def dev_kl(self, messages_list, max_new_tokens, metas=None):
+            self.metas = metas
+            return {"dev_kl": 0.5, "dev_len": 3.0}
+
+    engine = RecordingEngine()
+    source.evaluate(engine)
+    assert engine.metas == [source.meta(r) for r in source.dev_rows[:2]]
+
+    rendered = []
+
+    class Tok:
+        bos_token_id = None
+
+        def apply_chat_template(self, messages, tools=None, **kw):
+            rendered.append(messages[-1]["content"])
+            return messages[-1]["content"]
+
+        def encode(self, text, add_special_tokens=False):
+            return [len(text)]
+
+    class Route:
+        tokenizer = Tok()
+
+    pipe = Pipeline.__new__(Pipeline)
+    pipe.student_tok, pipe.routes, pipe.chat_template_kwargs = Tok(), {"t": Route()}, {}
+    request = pipe.request(rows[1]["messages"], 16, meta, "s", "t")
+    assert rendered == ["2+1?", "2+1?\n\n= 3"]  # student, then teacher
+    assert request.prompt_ids != request.teacher_prompt_ids
+
+
+def test_privileged_options_are_validated():
+    from palingenesis.opd.config import OPDConfig, OPDConfigError
+
+    def errors(**source):
+        config = OPDConfig()
+        config.set("model.student", "s", "test")
+        config.set("teachers.t.model", "t", "test")
+        config.set("sources.a.path", "a.jsonl", "test")
+        for key, value in source.items():
+            config.set(f"sources.a.{key}", value, "test")
+        try:
+            config.validate()
+        except OPDConfigError as exc:
+            return str(exc)
+        return ""
+
+    assert "privileged" not in errors(privileged_field="solution")
+    assert "privileged_template" in errors(privileged_field="solution", privileged_template="{content} only")
+    assert "privileged_template" in errors(privileged_field="solution", privileged_template="{content}{privileged}{x}")
+    assert "format 'messages' only" in errors(privileged_field="solution", format="mcqa")
