@@ -23,7 +23,7 @@ spec:
       containers:
         - name: trainer
           # Replace with ghcr.io/<owner>/<repository>@sha256:<published-digest>.
-          image: ghcr.io/mii-llm/palingenesis:latest
+          image: ghcr.io/m4oc/palingenesis:latest
           imagePullPolicy: Always
           args: [train, --config, /config/train.yaml]
           securityContext:
