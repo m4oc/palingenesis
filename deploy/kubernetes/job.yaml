@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: palingenesis-train
+spec:
+  # Avoid automatically repeating an expensive failed training run.
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      # For private GHCR images, create this Secret in the same namespace.
+      # imagePullSecrets:
+      #   - name: ghcr-pull
+      containers:
+        - name: trainer
+          # Replace with ghcr.io/<owner>/<repository>@sha256:<published-digest>.
+          image: ghcr.io/mii-llm/palingenesis:latest
+          imagePullPolicy: Always
+          args: [train, --config, /config/train.yaml]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: palingenesis-credentials
+                  key: HF_TOKEN
+                  optional: true
+          resources:
+            requests:
+              cpu: '4'
+              memory: 16Gi
+            limits:
+              cpu: '8'
+              memory: 32Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+              readOnly: true
+            - name: outputs
+              mountPath: /outputs
+            - name: cache
+              mountPath: /cache
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/trainer
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: config
+          configMap:
+            name: palingenesis-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: palingenesis-data
+        - name: outputs
+          persistentVolumeClaim:
+            claimName: palingenesis-outputs
+        - name: cache
+          persistentVolumeClaim:
+            claimName: palingenesis-cache
+        # Shared memory counts against the container's memory limit.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+        - name: workspace
+          emptyDir: {}

@@ -118,29 +118,6 @@ pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.js
 
 `distill-score` marks every multiple-choice pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. See the [distillation guide](https://mii-llm.github.io/palingenesis/guides/distillation/).
 
-**Privileged teacher context.** `sources.<name>.privileged_field` names a row field that only the teacher sees (a reference solution, a verifier's expected output); `privileged_template` (default `"{content}\n\n{privileged}"`) adds it to the teacher's copy of the last user turn. With the student's own checkpoint as the teacher this is on-policy self-distillation from privileged information (OPSD): the model is pulled toward what it would write if it knew the answer, on tasks where it rarely reaches the answer by itself.
-
-```yaml
-teachers:
-  self: {model: Qwen/Qwen3-0.6B}       # the student's own starting checkpoint
-sources:
-  hard_math:
-    path: data/hard_math.jsonl         # {"messages": [...], "solution": "..."}
-    teacher: self
-    privileged_field: solution
-    privileged_template: "{content}\n\nA correct solution, for reference only (do not mention it):\n{privileged}"
-```
-
-**Deployment sampling.** A distilled student can loop at its deployment sampling (e.g. Qwen's T 0.7 / top-p 0.8 / top-k 20) while looking fine at the rollout temperature, because training only visits its T=1 states. `sources.<name>.sampling_mix` samples part of a source's rollouts at other settings (`full_rkl` / `topk_kl` / `rs_kd` stay exact: they score the student's own distribution on whatever states were visited), and `train.eval_sampling` reports the dev loop rate and length at the deployment sampling:
-
-```yaml
-sources:
-  chat:
-    sampling_mix: [{weight: 1, temperature: 0.7, top_p: 0.8, top_k: 20}, {weight: 1}]   # half at deployment sampling
-train:
-  eval_sampling: {temperature: 0.7, top_p: 0.8, top_k: 20}                            # dev_loop/<source>, dev_len_deploy/<source>
-```
-
 ## Agentic RL on Harbor-style task environments
 
 Small verifiable tasks, one directory each in the [Harbor](https://harborframework.com) layout (`task.toml`, `instruction.md`, `environment/`, `tests/test.sh`, `solution/solve.sh`), run in local Docker containers with no cloud sandbox and no Harbor dependency. Each episode gets a fresh container with the task's limits and no network; the policy works through `bash` / `read_file` / `write_file` / `str_replace` / `submit`; the hidden tests then run in a clean container that holds only a copy of the working directory, so the agent cannot tamper with its own reward.
@@ -174,5 +151,10 @@ pytest tests/
 ```
 
 ---
+
+## Container deployment
+
+See [Containers and Kubernetes training](docs/containers.md) for the Docker image,
+GHCR publishing workflow, GPU Job manifests, persistent storage and runtime secrets.
 
 *A new form emerging from what came before.*

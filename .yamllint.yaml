@@ -1,0 +1,7 @@
+extends: relaxed
+rules:
+  line-length: disable
+  # GitHub Actions uses the YAML key "on" for workflow triggers.
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false
