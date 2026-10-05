@@ -2,15 +2,17 @@
 
 A task directory follows the Harbor layout (harborframework.com; the format used by e.g. SmolDataEnvs):
 
-    task.toml            [task] name/description, [environment] resources / network / env / healthcheck,
-                         [verifier] timeout + env, [agent] timeout, [metadata] anything
+    task.toml            [task] name/description, [environment] resources / network / env / healthcheck / workdir
+                         (default /workdir), [verifier] timeout + env + allow_internet (default: the environment's;
+                         e.g. an LLM judge while the agent stays offline), [agent] timeout, [metadata] anything
     instruction.md       what the agent is asked to do (the prompt)
     environment/         Docker build context (Dockerfile + files), or [environment] docker_image to reuse a prebuilt
                          image; environment/workdir/ (optional) is copied into the working directory at start and
                          environment/setup.sh (optional) runs once after it (a database, a git repository), so many
                          small tasks can share one image
     tests/test.sh        the verifier: runs after the episode, writes /logs/verifier/reward.txt (a number) or
-                         reward.json ({"name": value, ...}); anything else in tests/ is copied to /tests
+                         reward.json ({"name": value, ...}); anything else in tests/ is copied to /tests; the agent's
+                         final message (when the trainer passes the conversation) is at /logs/agent/final_message.md
     solution/solve.sh    optional oracle solution (used by check_task: the oracle must pass, doing nothing must not)
 
 palingenesis runs tasks itself (no Harbor dependency): images are built once per build-context hash and cached,
@@ -29,7 +31,8 @@ the ordinary environment protocol:
 
 Tools (native function calling; text protocols work through palingenesis.rl.env text_actions): bash(command,
 timeout), read_file(path), write_file(path, content), str_replace(path, old, new) (exact text, must occur once),
-submit() (ends the episode). The reward is the verifier's number, or its components (a reward.json dict: every key is
+submit() (ends the episode); files the tools write belong to the image's default user, so an unprivileged image user
+can still change them from the shell. The reward is the verifier's number, or its components (a reward.json dict: every key is
 logged as env/<key>, "reward" or the first key is the reward unless the caller maps them).
 
 The same task directories also run under the Harbor CLI with external harnesses (claude-code, codex, opencode,
@@ -88,6 +91,11 @@ class HarborTask:
     @property
     def verifier(self) -> dict:
         return self.config.get("verifier", {})
+
+    @property
+    def workdir(self) -> str | None:
+        """[environment] workdir: the task's working directory, when it is not /workdir."""
+        return self.environment.get("workdir")
 
     @property
     def agent_timeout(self) -> float:
@@ -164,28 +172,31 @@ class ExecResult:
 class DockerRuntime:
     """One task episode's container: start (limits, network, env, healthcheck), exec, files, verify, stop."""
 
-    def __init__(self, task: HarborTask, workdir: str = "/workdir", max_output: int = 16000):
+    def __init__(self, task: HarborTask, workdir: str | None = None, max_output: int = 16000):
         self.task = task
-        self.workdir = workdir
+        self.workdir = workdir or task.workdir or "/workdir"  # explicit > task.toml [environment] workdir > /workdir
         self.max_output = max_output
         self.name = f"pgs-{uuid.uuid4().hex[:12]}"
         self.started = False
+        self._owner: tuple[int, int] | None = None
 
-    def start(self, provision: bool = True) -> None:
-        """provision: copy the starting files and run environment/setup.sh (off for the verifier's clean container)."""
+    def start(self, provision: bool = True, allow_internet: bool | None = None) -> None:
+        """provision: copy the starting files and run environment/setup.sh (off for the verifier's clean container).
+        allow_internet: overrides the task's [environment] allow_internet (the verifier's container uses
+        [verifier] allow_internet)."""
         env = self.task.environment
         image = build_image(self.task)
         args = ["run", "-d", "--name", self.name, "--init",
                 "--cpus", str(env.get("cpus", 1)), "--memory", f"{int(env.get('memory_mb', 2048))}m",
                 "--pids-limit", str(env.get("pids_limit", 512))]
-        if not env.get("allow_internet", False):
+        if not (env.get("allow_internet", False) if allow_internet is None else allow_internet):
             args += ["--network", "none"]
         for k, v in (env.get("env") or {}).items():
             args += ["-e", f"{k}={os.path.expandvars(str(v))}"]
         args += [image, "sleep", "infinity"]
         _docker(*args, timeout=120)
         self.started = True
-        self.exec(f"mkdir -p {shlex.quote(self.workdir)} /logs/verifier", timeout=30)
+        self.exec(f"mkdir -p {shlex.quote(self.workdir)} /logs/verifier", timeout=30, workdir="/")  # may not exist yet
         seed = self.task.build_context / "workdir"  # starting files copied in (many tasks can share one image)
         if provision and seed.exists():
             self.put_dir(seed, self.workdir)
@@ -223,15 +234,28 @@ class DockerRuntime:
             out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2:]
         return ExecResult(r.returncode, out, err[-cut:])
 
-    def put_files(self, files: dict[str, bytes | str], dest: str = "/") -> None:
+    def owner(self) -> tuple[int, int]:
+        """uid / gid of the image's default user (what the agent's shell runs as)."""
+        if self._owner is None:
+            r = self.exec("id -u; id -g", timeout=30, workdir="/")
+            ids = r.stdout.split()
+            self._owner = (int(ids[0]), int(ids[1])) if r.exit_code == 0 and len(ids) >= 2 else (0, 0)
+        return self._owner
+
+    def put_files(self, files: dict[str, bytes | str], dest: str = "/", as_user: bool = False) -> None:
+        """Copy files in. as_user: owned by the image's default user (docker cp otherwise creates them as root, which
+        an unprivileged image user cannot change afterwards)."""
+        uid, gid = self.owner() if as_user else (0, 0)
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
             for path, data in files.items():
                 data = data.encode() if isinstance(data, str) else data
                 info = tarfile.TarInfo(path.lstrip("/"))
                 info.size, info.mode = len(data), 0o755 if path.endswith(".sh") else 0o644
+                info.uid, info.gid = uid, gid
                 tar.addfile(info, io.BytesIO(data))
-        _docker("cp", "-", f"{self.name}:{dest}", input=buf.getvalue(), timeout=60)
+        cp = ["cp", "-a"] if as_user and (uid, gid) != (0, 0) else ["cp"]  # -a keeps the tar's ownership
+        _docker(*cp, "-", f"{self.name}:{dest}", input=buf.getvalue(), timeout=60)
 
     def put_dir(self, local: Path, dest: str) -> None:
         files = {str(Path(dest.lstrip("/")) / p.relative_to(local)): p.read_bytes() for p in local.rglob("*") if p.is_file()}
@@ -246,10 +270,12 @@ class DockerRuntime:
         """The tar stream of a directory in the container."""
         return _docker("cp", f"{self.name}:{path}", "-", timeout=120).stdout
 
-    def verify(self, isolated: bool = True) -> dict[str, float]:
+    def verify(self, isolated: bool = True, final_message: str | None = None) -> dict[str, float]:
         """Run the task's tests and read the reward. isolated (default): the working directory is copied into a fresh
         container from the pristine image and tested there, so nothing the agent left behind (a background process
-        rewriting the reward, a patched package, a pytest.py shadowing pytest) can reach the verifier."""
+        rewriting the reward, a patched package, a pytest.py shadowing pytest) can reach the verifier. That container
+        has network only if [verifier] allow_internet (default: the environment's) allows it. final_message: the
+        agent's last reply, given to the tests as /logs/agent/final_message.md."""
         tests = self.task.root / "tests"
         if not tests.exists():
             raise FileNotFoundError(f"{self.task.name}: no tests/ directory")
@@ -257,13 +283,16 @@ class DockerRuntime:
             archive = self.get_dir(self.workdir)
             clean = DockerRuntime(self.task, self.workdir, self.max_output)
             try:
-                clean.start(provision=False)
+                clean.start(provision=False, allow_internet=self.task.verifier.get("allow_internet"))
                 clean.exec(f"rm -rf {shlex.quote(self.workdir)}", timeout=30, workdir="/")
                 _docker("cp", "-", f"{clean.name}:{str(Path(self.workdir).parent)}", input=archive, timeout=120)
-                return clean.verify(isolated=False)
+                return clean.verify(isolated=False, final_message=final_message)
             finally:
                 clean.stop()
-        self.exec("rm -rf /tests /logs/verifier && mkdir -p /tests /logs/verifier", timeout=30, workdir="/")
+        self.exec("rm -rf /tests /logs/verifier /logs/agent && mkdir -p /tests /logs/verifier /logs/agent", timeout=30,
+                  workdir="/")
+        if final_message is not None:
+            self.put_files({"/logs/agent/final_message.md": final_message}, "/")
         self.put_dir(tests, "/tests")
         venv = {k: os.path.expandvars(str(v)) for k, v in (self.task.verifier.get("env") or {}).items()}
         r = self.exec("bash /tests/test.sh", timeout=float(self.task.verifier.get("timeout_sec", 120)), env=venv, workdir="/")
@@ -314,7 +343,7 @@ class HarborEnv:
     the task's tests as the reward. Rows carry "task_dir". Synchronous (the pipeline runs sync methods in worker threads),
     so other environments can compose it; the container stops when the episode is released (close)."""
 
-    def __init__(self, tools: list[str] | None = None, reward_key: str = "reward", workdir: str = "/workdir",
+    def __init__(self, tools: list[str] | None = None, reward_key: str = "reward", workdir: str | None = None,
                  max_output: int = 16000):
         self.tool_names = list(tools or TOOL_SCHEMAS)
         self.reward_key = reward_key
@@ -326,7 +355,7 @@ class HarborEnv:
     def reset(self, task_dir: str, **row) -> None:
         self.close()
         self.task = HarborTask.load(task_dir)
-        self.rt = DockerRuntime(self.task, self.workdir, self.max_output)
+        self.rt = DockerRuntime(self.task, self.workdir, self.max_output)  # workdir None: the task's (or /workdir)
         self.done = False
         self.rt.start()
 
@@ -347,13 +376,13 @@ class HarborEnv:
             return text if text is not None else f"Error: cannot read {arguments.get('path')!r}"
         if name == "write_file":
             path = str(arguments.get("path", ""))
-            p = path if path.startswith("/") else f"{self.workdir}/{path}"
+            p = path if path.startswith("/") else f"{rt.workdir}/{path}"
             rt.exec(f"mkdir -p {shlex.quote(str(Path(p).parent))}", 30)
-            rt.put_files({p: str(arguments.get("content", ""))}, "/")
+            rt.put_files({p: str(arguments.get("content", ""))}, "/", as_user=True)
             return f"Wrote {p}."
         if name == "str_replace":
             path = str(arguments.get("path", ""))
-            p = path if path.startswith("/") else f"{self.workdir}/{path}"
+            p = path if path.startswith("/") else f"{rt.workdir}/{path}"
             text = rt.read_file(p)
             if text is None:
                 return f"Error: cannot read {p}"
@@ -361,16 +390,19 @@ class HarborEnv:
             n = text.count(old)
             if n != 1:
                 return f"Error: the text occurs {n} times in {p}; it must occur exactly once"
-            rt.put_files({p: text.replace(old, str(arguments.get("new", "")))}, "/")
+            rt.put_files({p: text.replace(old, str(arguments.get("new", "")))}, "/", as_user=True)
             return f"Edited {p}."
         return f"Error: unknown tool {name!r}"
 
-    def get_reward(self):
+    def get_reward(self, messages: list[dict] | None = None):
+        """The verifier's reward; with the conversation (the RL pipeline passes it), the last assistant reply is given
+        to the tests as /logs/agent/final_message.md."""
         rt = self.rt
         if rt is None:
             return None
+        final = next((m.get("content") or "" for m in reversed(messages or []) if m.get("role") == "assistant"), None)
         try:
-            comps = rt.verify()
+            comps = rt.verify(final_message=final)
         except Exception as e:  # noqa: BLE001 — a broken verifier scores 0 and is flagged
             logger.warning("verifier failed for %s: %s", self.task.name, e)
             comps = {"reward": 0.0, "metric/verifier_failed": 1.0}
@@ -389,12 +421,13 @@ class HarborEnv:
 # ------------------------------------------------------------------ validation and external harnesses
 
 
-def check_task(task_dir: str | Path) -> dict:
-    """Harbor's oracle / nop check: the oracle solution (solution/solve.sh) must pass, doing nothing must not."""
+def check_task(task_dir: str | Path, workdir: str | None = None) -> dict:
+    """Harbor's oracle / nop check: the oracle solution (solution/solve.sh) must pass, doing nothing must not.
+    workdir: overrides the task's working directory ([environment] workdir, else /workdir)."""
     task = HarborTask.load(task_dir)
     out = {"task": task.name}
     for mode in ("nop", "oracle"):
-        rt = DockerRuntime(task)
+        rt = DockerRuntime(task, workdir)
         try:
             rt.start()
             if mode == "oracle":
@@ -426,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("tasks_dir")
     c.add_argument("--workers", type=int, default=8)
     c.add_argument("--json", action="store_true")
+    c.add_argument("--workdir", default=None, help="working directory when the tasks do not set [environment] workdir")
     r = sub.add_parser("rows", help="write training rows (task_dir + prompt) for HarborEnv")
     r.add_argument("tasks_dir")
     r.add_argument("out")
@@ -440,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     dirs = [root] if (root / "task.toml").exists() else sorted(d for d in root.iterdir() if (d / "task.toml").exists())
     with ThreadPoolExecutor(a.workers) as ex:
-        results = list(ex.map(check_task, dirs))
+        results = list(ex.map(lambda d: check_task(d, a.workdir), dirs))
     if a.json:
         print(json.dumps(results, indent=1))
     else:
