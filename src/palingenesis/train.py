@@ -221,6 +221,32 @@ def _resolve_total_steps(config: Config, world_size: int, make_dataloader, devic
     return total_steps
 
 
+
+def eval_reader(config, tokenizer, eval_ds):
+    """The held-out set's reader, matching training: raw text with all-token loss when every data source is
+    `mode: pretrain` (a CPT run; a chat reader would find no messages and silently disable validation), otherwise
+    chat with the same masking as training (include_observations, train_on_reasoning): otherwise eval measures a
+    different token set than the one being optimized, e.g. with ECHO (observations trained but excluded from eval)
+    assistant-only eval CE can rise while the training objective improves, which reads as phantom overfitting.
+    turn_scaling is irrelevant here: eval computes unweighted CE."""
+    from palingenesis.data import ChatDataset, PretrainDataset
+
+    sources = config.data.sources or []
+    if sources and all((src or {}).get("mode", "sft") == "pretrain" for src in sources):
+        return PretrainDataset(eval_ds, tokenizer, config.data.max_seq_length, text_field=sources[0].get("text_field", "text"))
+    return ChatDataset(
+        eval_ds,
+        tokenizer,
+        config.data.max_seq_length,
+        config.data.messages_field,
+        rank=0,
+        world_size=1,
+        include_observations=config.data.include_observations,
+        train_on_reasoning=config.data.train_on_reasoning,
+        last_turn_only=config.data.last_turn_only,
+        tools_field=config.data.tools_field,
+    )
+
 def train(config: Config):
     # ── CUDA allocator: expandable segments ───────────────────────────────
     # Variable-length batches fragment the caching allocator (tens of GB
@@ -761,26 +787,9 @@ def train(config: Config):
     elif config.data.eval_dataset and not config.data.eval_sources:
         logger.info(f"Loading eval dataset: {config.data.eval_dataset} (split={config.data.eval_split})")
         eval_ds = _load_dataset_source(config.data.eval_dataset, config.data.eval_split, streaming=True)
-        from palingenesis.data import ChatDataset, _collate_fn
+        from palingenesis.data import _collate_fn
 
-        # Same masking as TRAINING (include_observations, train_on_reasoning):
-        # otherwise eval measures a different token set than the one being
-        # optimized — e.g. with ECHO (observations trained, but excluded from
-        # eval) assistant-only eval CE can rise while the actual training
-        # objective improves, which reads as phantom "overfitting".
-        # turn_scaling is irrelevant here: eval computes unweighted CE.
-        eval_chat = ChatDataset(
-            eval_ds,
-            tokenizer,
-            config.data.max_seq_length,
-            config.data.messages_field,
-            rank=0,
-            world_size=1,
-            include_observations=config.data.include_observations,
-            train_on_reasoning=config.data.train_on_reasoning,
-            last_turn_only=config.data.last_turn_only,
-            tools_field=config.data.tools_field,
-        )
+        eval_chat = eval_reader(config, tokenizer, eval_ds)
         # Pre-collect fixed eval samples (no streaming randomness)
         eval_batches = []
         count = 0
